@@ -181,6 +181,12 @@ def main_gui():
     limit_entry = ttk.Entry(f2, textvariable=limit_num_var, width=6)
     limit_entry.pack(side="left", padx=2)
     ttk.Label(f2, text="matches").pack(side="left", padx=2)
+    ttk.Label(
+        f2,
+        text="(counts existing CSV rows — enable Fresh run to replace with a new top-N)",
+        font=("", 8),
+        foreground="gray",
+    ).pack(side="left", padx=(8, 0))
 
     f3 = ttk.Frame(root)
     f3.pack(fill="x", **pad)

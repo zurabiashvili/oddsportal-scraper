@@ -13,7 +13,7 @@ import csv
 import re
 import time
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
@@ -83,31 +83,66 @@ def _match_row_incomplete(md: MatchData) -> bool:
     )
 
 
-def _date_sort_key(m: MatchData) -> tuple:
-    """Return sort key for chronological order (oldest first). Unparseable dates go last."""
-    s = re.sub(r"\s+", " ", (m.date or "").strip().replace("\n", " "))[:50]
-    for fmt in ("%d %b %Y, %H:%M", "%d %b %Y", "%Y-%m-%d", "%d/%m/%Y", "%d.%m.%Y"):
+def _parse_match_datetime(s: str) -> datetime | None:
+    """Parse OddsPortal date strings (incl. 'Today, 11 Apr' and messy newlines) for sort/export."""
+    if not s:
+        return None
+    s = re.sub(r"\s+", " ", str(s).strip().replace("\n", " "))[:120].strip()
+    if not s:
+        return None
+    if re.match(r"(?i)today\s*,", s):
+        m = re.search(
+            r"(?i)today\s*,\s*(\d{1,2}\s+[A-Za-z]{3})(?:\s+(\d{4}))?(?:\s*,\s*(\d{1,2}:\d{2}))?",
+            s,
+        )
+        if m:
+            dpart, year_s, tim = m.group(1), m.group(2), m.group(3)
+            year = int(year_s) if year_s else date.today().year
+            try:
+                if tim:
+                    return datetime.strptime(f"{dpart} {year} {tim}", "%d %b %Y %H:%M")
+                return datetime.strptime(f"{dpart} {year}", "%d %b %Y")
+            except ValueError:
+                pass
+    for fmt in (
+        "%d %b %Y, %H:%M",
+        "%d %b %Y",
+        "%Y-%m-%d",
+        "%d/%m/%Y",
+        "%d.%m.%Y",
+    ):
         try:
-            return (datetime.strptime(s.strip(), fmt),)
+            return datetime.strptime(s, fmt)
         except (ValueError, TypeError):
             continue
-    return (datetime.max,)  # Unparseable: put at end
+    return None
+
+
+def normalize_match_date_field(raw: str) -> str:
+    """Export one consistent format: 'dd Mon YYYY' or 'dd Mon YYYY, HH:MM'. Collapses stray newlines."""
+    if not raw:
+        return ""
+    dt = _parse_match_datetime(raw)
+    if not dt:
+        return re.sub(r"\s+", " ", str(raw).strip().replace("\n", " "))
+    if dt.hour or dt.minute:
+        return dt.strftime("%d %b %Y, %H:%M")
+    return dt.strftime("%d %b %Y")
+
+
+def _sort_results_for_export(results: list, oldest_first: bool) -> None:
+    """Order CSV/export: oldest_first → chronological; newest_first → most recent match at top."""
+    _sent = datetime(9999, 12, 31, 23, 59, 59)
+
+    def key(md: MatchData) -> datetime:
+        return _parse_match_datetime(md.date or "") or _sent
+
+    results.sort(key=key, reverse=not oldest_first)
 
 
 def _sort_results_chronological(results: list) -> None:
-    """Sort match results chronologically (oldest match first)."""
-    results.sort(key=_date_sort_key)
-
-
-def _dict_match_date_sort_key(m: dict) -> datetime:
-    """Sort key for match dicts from results page (uses date string). Unparseable → oldest."""
-    s = re.sub(r"\s+", " ", (m.get("date") or "").strip().replace("\n", " "))[:80]
-    for fmt in ("%d %b %Y, %H:%M", "%d %b %Y", "%Y-%m-%d", "%d/%m/%Y", "%d.%m.%Y"):
-        try:
-            return datetime.strptime(s.strip(), fmt)
-        except (ValueError, TypeError):
-            continue
-    return datetime.min
+    """Backward-compatible: oldest match first."""
+    _sort_results_for_export(results, oldest_first=True)
 
 
 def _normalize_eu_odds_text(s: str) -> str:
@@ -158,6 +193,39 @@ def _betting_exchanges_block_start(low_full: str) -> int:
         if i >= 0:
             return i
     return low_full.rfind("betfair")
+
+
+def _slice_page_text_for_ht_betfair(page_text: str) -> str:
+    """When 1st Half O/U is selected, innerText can still mention 'Full Time' elsewhere; prefer the slice from
+    the last '1st Half' / 'Half Time' marker before the Betting Exchanges block so Lay parsing matches HT."""
+    if not page_text:
+        return page_text
+    low = page_text.lower()
+    bi = _betting_exchanges_block_start(low)
+    if bi < 0:
+        return page_text
+    before = page_text[:bi]
+    low_b = before.lower()
+    hi = low_b.rfind("1st half")
+    if hi < 0:
+        hi = low_b.rfind("half time")
+    if hi < 0:
+        return page_text
+    return page_text[hi:]
+
+
+def _parse_betfair_lay_prefer_ht(combined: str, fallback: str, market: str) -> tuple[str | None, str | None]:
+    """Parse Lay odds; for HT market try text from the 1st Half section first so Full Time Betfair is not matched."""
+    blob = (combined or fallback or "").strip()
+    if not blob:
+        return None, None
+    if market == "ht":
+        sl = _slice_page_text_for_ht_betfair(blob)
+        if sl:
+            lo, lu = _parse_betfair_exchange_lay_odds(sl)
+            if lo or lu:
+                return lo, lu
+    return _parse_betfair_exchange_lay_odds(blob)
 
 
 def _parse_betfair_exchange_lay_odds(page_text: str) -> tuple[str | None, str | None]:
@@ -642,6 +710,22 @@ def _is_match_page_url(href: str) -> bool:
         return False
 
 
+def _match_listing_log_label(m: dict) -> str:
+    """Progress/log line: use real names only when listing row had them; else URL tail (slug order misleads)."""
+    h = (m.get("home_team") or "").strip()
+    aw = (m.get("away_team") or "").strip()
+    if h and aw and h != "?" and aw != "?":
+        return f"{h} vs {aw}"
+    tail = (m.get("match_url") or "").rstrip("/").split("/")[-1]
+    return tail[:70] if tail else "?"
+
+
+def _listing_has_real_teams(m: dict) -> bool:
+    h = (m.get("home_team") or "").strip()
+    a = (m.get("away_team") or "").strip()
+    return bool(h and a and h != "?" and a != "?")
+
+
 # Display tweaks for teams that don't round-trip from URL slugs
 _TEAM_DISPLAY = {
     "g a eagles": "G.A. Eagles",
@@ -652,6 +736,7 @@ _TEAM_DISPLAY = {
     "afc wimbledon": "AFC Wimbledon",
     "bradford city": "Bradford City",
     "lincoln city": "Lincoln City",
+    "rotherhan": "Rotherham",
     "port vale": "Port Vale",
     "stockport county": "Stockport County",
     "milton keynes dons": "Milton Keynes Dons",
@@ -714,7 +799,12 @@ def _split_legacy_combined_slug(team_slug: str) -> tuple[str, str]:
 
 
 def teams_from_match_url(href: str) -> tuple[str, str]:
-    """Display names from URL. For /h2h/ URLs, segment order is NOT always home/away (often alphabetical)."""
+    """Display names from URL.
+
+    For /h2h/, segment order is not always home/away (often alphabetical).
+    For normal league match URLs, the last path segment combines both clubs; split heuristics
+    (midpoint / compounds) do **not** follow actual home stadium order — use listing row or match page.
+    """
     href = (href or "").strip().split("?")[0].split("#")[0]
     try:
         path = urlparse(href).path.strip("/")
@@ -739,8 +829,27 @@ def teams_from_match_url(href: str) -> tuple[str, str]:
         return "?", "?"
 
 
+def _looks_like_team_line(s: str) -> bool:
+    """Non-score, non-date line that could be a club name (OddsPortal result rows)."""
+    if not s or len(s) > 54:
+        return False
+    lo = s.lower()
+    if lo in ("finished", "live", "postponed", "ft", "ht", "over", "under"):
+        return False
+    if re.match(r"^\d{1,2}\s*[-:]\s*\d{1,2}$", s):
+        return False
+    if re.match(r"(?i)^(today|yesterday)\s*,", s):
+        return False
+    if re.match(r"^\d{1,2}\s+[A-Za-z]{3}\s+20\d{2}", s):
+        return False
+    return bool(re.search(r"[A-Za-z]", s))
+
+
 def _parse_home_away_from_results_row(a) -> tuple[str | None, str | None]:
-    """Infer home (left) vs away (right) from a results-table row — fixes /h2h/ URL slug order."""
+    """Infer home vs away from a results row. OddsPortal uses two layouts:
+    (A) home | away | score  (both teams above the FT score — common on La Liga results)
+    (B) home | score | away
+    """
     try:
         p = a.parent
         for _ in range(15):
@@ -753,6 +862,19 @@ def _parse_home_away_from_results_row(a) -> tuple[str | None, str | None]:
                     continue
                 if not _is_likely_score(line.replace(":", "-")):
                     continue
+                # Pattern A: home, away, then score (indices i-2, i-1, i)
+                if i >= 2:
+                    t_home, t_away = lines[i - 2], lines[i - 1]
+                    if (
+                        _looks_like_team_line(t_home)
+                        and _looks_like_team_line(t_away)
+                        and len(t_home) < 55
+                        and len(t_away) < 55
+                    ):
+                        if t_home.lower() in ("finished", "live", "postponed"):
+                            continue
+                        return _apply_team_display(t_home, t_away)
+                # Pattern B: home | score | away
                 if i < 1 or i + 1 >= len(lines):
                     continue
                 hi = i - 1
@@ -793,6 +915,11 @@ def _parse_home_away_from_match_page(html: str, inner_text: str) -> tuple[str | 
             mm = re.match(pat, t, re.I)
             if mm and 2 < len(mm.group(1)) < 55 and 2 < len(mm.group(2)) < 55:
                 return _apply_team_display(mm.group(1).strip(), mm.group(2).strip())
+        # OddsPortal titles/breadcrumbs often use "Home - Away" (not "vs"), e.g. Burton - AFC Wimbledon
+        if re.search(r"[-–]", t) and len(t) < 130:
+            parts = re.split(r"\s+[-–]\s+", t, maxsplit=1)
+            if len(parts) == 2 and 2 < len(parts[0].strip()) < 55 and 2 < len(parts[1].strip()) < 55:
+                return _apply_team_display(parts[0].strip(), parts[1].strip())
     for line in ht.split("\n")[:120]:
         line = line.strip()
         if len(line) < 5 or len(line) > 90:
@@ -803,6 +930,11 @@ def _parse_home_away_from_match_page(html: str, inner_text: str) -> tuple[str | 
         mm = re.match(r"^(.+?)\s+vs\.?\s+(.+?)$", line, re.I)
         if mm and len(mm.group(2)) < 60:
             return _apply_team_display(mm.group(1).strip(), mm.group(2).strip())
+        mm2 = re.match(r"^(.+?)\s+[-–]\s+(.+)$", line)
+        if mm2 and len(mm2.group(2)) < 60 and not re.match(r"^\d{1,2}\s*[-–]\s*\d{1,2}$", line):
+            a, b = mm2.group(1).strip(), mm2.group(2).strip()
+            if re.search(r"[A-Za-z]", a) and re.search(r"[A-Za-z]", b):
+                return _apply_team_display(a, b)
     return None, None
 
 
@@ -948,6 +1080,18 @@ def _is_likely_score(val: str) -> bool:
         return False
 
 
+def _match_row_has_final_score(m: dict) -> bool:
+    """True when the listing row has a full-time result (excludes upcoming kickoff rows with no score)."""
+    raw = (m.get("score_ft") or "").strip()
+    if not raw:
+        return False
+    s = raw.replace("–", "-").replace("—", "-")
+    s = re.sub(r"\s+", "", s)
+    if not re.match(r"^\d{1,2}[:-]\d{1,2}$", s):
+        return False
+    return _is_likely_score(s.replace("-", ":"))
+
+
 def parse_results_page_html(html: str, base_url: str, league_name: str) -> list[dict]:
     """Parse results page and extract match links with date, teams, scores."""
     from bs4 import BeautifulSoup
@@ -975,10 +1119,11 @@ def parse_results_page_html(html: str, base_url: str, league_name: str) -> list[
         seen_urls.add(href)
 
         home, away = teams_from_match_url(href)
-        if "/h2h/" in href.lower():
-            ha, aw = _parse_home_away_from_results_row(a)
-            if ha and aw:
-                home, away = ha, aw
+        # Table row left/right of the score is home/away (authoritative). Applies to league URLs and /h2h/.
+        ha, aw = _parse_home_away_from_results_row(a)
+        row_teams_ok = bool(ha and aw)
+        if row_teams_ok:
+            home, away = ha, aw
 
         parent = a.parent
         date_val, score_ft, score_ht = "", "", ""
@@ -988,7 +1133,12 @@ def parse_results_page_html(html: str, base_url: str, league_name: str) -> list[
             text = parent.get_text(separator="\n").strip()
             lines = [l.strip() for l in text.split("\n") if l.strip()]
             for line in lines:
-                if re.match(r"[\d]{2}[/.-][\d]{2}[/.-][\d]{2,4}|[\d]{1,2}\s+[A-Za-z]+\s+[\d]{4}", line):
+                if re.match(r"(?i)today\s*,\s*\d{1,2}\s+[A-Za-z]{3}", line):
+                    date_val = line
+                elif re.match(
+                    r"[\d]{2}[/.-][\d]{2}[/.-][\d]{2,4}|[\d]{1,2}\s+[A-Za-z]+\s+[\d]{4}",
+                    line,
+                ):
                     date_val = line
                 elif re.match(r"^\(\d+[:\-]\d+\)", line):
                     score_ht = line.strip("()").replace("-", ":")
@@ -998,12 +1148,14 @@ def parse_results_page_html(html: str, base_url: str, league_name: str) -> list[
                 break
             parent = getattr(parent, "parent", None)
 
-        # Override with link text if it has " - " (team names)
-        link_text = a.get_text(strip=True)
-        if " - " in link_text and len(link_text) < 80:
-            parts = link_text.split(" - ", 1)
-            if len(parts) == 2:
-                home, away = parts[0].strip(), parts[1].strip()
+        # Link text "Team A - Team B" is often alphabetical or UI order, not home-away — do not overwrite
+        # row-based teams (see _parse_home_away_from_results_row).
+        if not row_teams_ok:
+            link_text = a.get_text(strip=True)
+            if " - " in link_text and len(link_text) < 80:
+                parts = link_text.split(" - ", 1)
+                if len(parts) == 2:
+                    home, away = parts[0].strip(), parts[1].strip()
 
         matches.append({
             "date": date_val,
@@ -1019,13 +1171,156 @@ def parse_results_page_html(html: str, base_url: str, league_name: str) -> list[
 
 
 def _merge_match_rows_by_url(rows: list[dict], extra: list[dict]) -> list[dict]:
-    seen = {m["match_url"] for m in rows}
+    """Union by match_url. Embedded/DOM rows often have home=? away=?; later HTML parse may add real teams — upgrade."""
+    url_to_i = {m["match_url"]: i for i, m in enumerate(rows) if m.get("match_url")}
     for m in extra:
         u = m.get("match_url", "")
-        if u and u not in seen:
-            seen.add(u)
+        if not u:
+            continue
+        if u not in url_to_i:
             rows.append(m)
+            url_to_i[u] = len(rows) - 1
+            continue
+        ix = url_to_i[u]
+        old = rows[ix]
+        new_ok = _listing_has_real_teams(m)
+        old_ok = _listing_has_real_teams(old)
+        if new_ok and not old_ok:
+            rows[ix] = {**old, **m}
+            continue
+        merged = dict(old)
+        for k in ("date", "score_ft", "score_ht"):
+            if not (merged.get(k) or "").strip() and (m.get(k) or "").strip():
+                merged[k] = m[k]
+        rows[ix] = merged
     return rows
+
+
+async def enrich_match_teams_from_results_layout(page, matches: list[dict]) -> None:
+    """Set home_team / away_team from **on-screen left-to-right** order (home is left on OddsPortal).
+
+    Plain HTML parsing uses DOM text order, which often differs from visual order in flex rows.
+    """
+    if not page or not matches:
+        return
+    urls = list({(m.get("match_url") or "").strip() for m in matches if (m.get("match_url") or "").strip()})
+    if not urls:
+        return
+    try:
+        raw = await page.evaluate(
+            """(matchUrls) => {
+            const normPath = (u) => {
+                try {
+                    return new URL(u).pathname.replace(/\\/+$/, '') || '';
+                } catch (e) {
+                    return '';
+                }
+            };
+            const teamish = (t) => {
+                t = String(t || '').split('\\n')[0].trim();
+                if (t.length < 2 || t.length > 52) return false;
+                if (/^(Today|Yesterday)\\b/i.test(t)) return false;
+                if (/^\\d{1,2}\\s*[-:]\\s*\\d{1,2}$/.test(t)) return false;
+                if (/^\\d{1,2}\\s+[A-Za-z]{3}\\s+20\\d{2}/.test(t)) return false;
+                return /[a-z]/i.test(t);
+            };
+            const splitByScore = (row) => {
+                const t = String(row.innerText || '').replace(/\\s+/g, ' ').trim();
+                const m = t.match(/^(.+?)\\s+(\\d{1,2}\\s*[-:]\\s*\\d{1,2})\\s+(.+)$/);
+                if (!m) return null;
+                let left = m[1].replace(/^(Today|Yesterday),\\s*\\d{1,2}\\s+[A-Za-z]{3}\\s*,?\\s*/i, '').trim();
+                const right = m[3].trim();
+                if (teamish(left) && teamish(right) && left !== right) return [left, right];
+                return null;
+            };
+            const out = {};
+            for (const matchUrl of matchUrls) {
+                const path = normPath(matchUrl);
+                if (!path) continue;
+                const anchor = [...document.querySelectorAll('a[href]')].find(
+                    (el) => normPath(el.href) === path
+                );
+                if (!anchor) {
+                    out[path] = null;
+                    continue;
+                }
+                let row = anchor.parentElement;
+                let found = null;
+                for (let depth = 0; depth < 14 && row && !found; depth++) {
+                    const r = row.getBoundingClientRect();
+                    if (r.width < 80) {
+                        row = row.parentElement;
+                        continue;
+                    }
+                    const picks = [];
+                    row.querySelectorAll('[class*="participant"], [class*="Participant"]').forEach((el) => {
+                        const t = String(el.innerText || '').split('\\n')[0].trim();
+                        if (!teamish(t)) return;
+                        picks.push({ t, x: el.getBoundingClientRect().left });
+                    });
+                    if (picks.length >= 2) {
+                        picks.sort((a, b) => a.x - b.x);
+                        if (picks[0].t !== picks[1].t) found = [picks[0].t, picks[1].t];
+                    }
+                    if (!found) {
+                        const links = [...row.querySelectorAll('a[href*="/football/"]')].filter((el) => {
+                            const h = el.href || '';
+                            if (/results|standings|outrights|fixtures/i.test(h) || h.includes('draw/')) return false;
+                            const t = String(el.innerText || '').split('\\n')[0].trim();
+                            return teamish(t);
+                        });
+                        if (links.length >= 2) {
+                            const sorted = links
+                                .map((el) => ({
+                                    t: String(el.innerText || '').trim().split('\\n')[0],
+                                    x: el.getBoundingClientRect().left,
+                                }))
+                                .sort((a, b) => a.x - b.x);
+                            const seen = new Set();
+                            const names = [];
+                            for (const p of sorted) {
+                                if (seen.has(p.t)) continue;
+                                seen.add(p.t);
+                                names.push(p.t);
+                                if (names.length >= 2) break;
+                            }
+                            if (names.length >= 2) found = names;
+                        }
+                    }
+                    if (!found) {
+                        const sp = splitByScore(row);
+                        if (sp) found = sp;
+                    }
+                    row = row.parentElement;
+                }
+                out[path] = found;
+            }
+            return out;
+        }""",
+            urls,
+        )
+    except Exception as ex:
+        print(f"  Note: layout team enrichment failed: {ex}", flush=True)
+        return
+    if not isinstance(raw, dict):
+        return
+    for m in matches:
+        url = (m.get("match_url") or "").strip()
+        if not url:
+            continue
+        key = urlparse(url).path.rstrip("/")
+        pair = raw.get(key)
+        if pair is None:
+            pair = raw.get(key + "/")
+        if (
+            isinstance(pair, (list, tuple))
+            and len(pair) == 2
+            and pair[0]
+            and pair[1]
+            and str(pair[0]).strip() != str(pair[1]).strip()
+        ):
+            m["home_team"] = str(pair[0]).strip()
+            m["away_team"] = str(pair[1]).strip()
 
 
 def extract_matches_from_embedded_urls(html: str, league_url: str, league_name: str) -> list[dict]:
@@ -1079,12 +1374,13 @@ def extract_matches_from_embedded_urls(html: str, league_url: str, league_name: 
         if href in seen:
             continue
         seen.add(href)
-        home, away = teams_from_match_url(href)
+        # Slug word order ≠ home/away (often alphabetical). Names come from parse_results_page_html
+        # (row layout) or scrape_match — do not guess from URL here.
         out.append(
             {
                 "date": "",
-                "home_team": home,
-                "away_team": away,
+                "home_team": "?",
+                "away_team": "?",
                 "score_ft": "",
                 "score_ht": "",
                 "match_url": href,
@@ -1137,12 +1433,11 @@ async def collect_matches_from_dom(page, league_url: str, league_name: str) -> l
         if href in seen_u:
             continue
         seen_u.add(href)
-        home, away = teams_from_match_url(href)
         matches.append(
             {
                 "date": "",
-                "home_team": home,
-                "away_team": away,
+                "home_team": "?",
+                "away_team": "?",
                 "score_ft": "",
                 "score_ht": "",
                 "match_url": href,
@@ -1178,13 +1473,18 @@ async def collect_h2h_matches_ordered(page, league_url: str, league_name: str) -
     }"""
     )
     out: list[dict] = []
-    for href in raw or []:
-        href = str(href).strip()
+    for item in raw or []:
+        if isinstance(item, dict):
+            href = str((item.get("href") or item.get("url") or "")).strip()
+        else:
+            href = str(item).strip()
         if league_url and not _match_url_belongs_to_league(href, league_url):
             continue
         if not _is_match_page_url(href):
             continue
-        home, away = teams_from_match_url(href)
+        # URL slug order for /h2h/ is not home/away; visible "X - Y" labels are often alphabetical.
+        # Leave teams unknown so merge uses scrape_match header JSON/title, not wrong listing names.
+        home, away = "?", "?"
         out.append(
             {
                 "date": "",
@@ -1301,11 +1601,14 @@ async def scrape_match(
             tab_labels = ["Full Time"]
         else:
             tab_labels = ["1st Half", "Half Time"]  # Try OddsPortal's exact label first
+        period_tab_ok = False
         for tab_label in tab_labels:
             try:
                 mt = page.get_by_text(tab_label, exact=True).first
+                await mt.scroll_into_view_if_needed(timeout=3000)
                 await mt.click(timeout=2000)
                 await asyncio.sleep(2)
+                period_tab_ok = True
                 break
             except Exception:
                 pass
@@ -1319,6 +1622,18 @@ async def scrape_match(
                 try:
                     await page.get_by_text("Full Time", exact=False).first.click(timeout=2000)
                     await asyncio.sleep(2)
+                except Exception:
+                    pass
+        elif not period_tab_ok:
+            try:
+                ht_tab = page.get_by_role("tab", name=re.compile(r"^\s*1st\s+Half\s*$", re.I)).first
+                await ht_tab.scroll_into_view_if_needed(timeout=3000)
+                await ht_tab.click(timeout=3000)
+                await asyncio.sleep(3)
+            except Exception:
+                try:
+                    await page.get_by_text("1st Half", exact=False).first.click(timeout=2500)
+                    await asyncio.sleep(3)
                 except Exception:
                     pass
         # Click the selected line row (+0.5, +1.5, or +2.5) - may expand to show Betfair
@@ -1529,15 +1844,14 @@ async def scrape_match(
             combined_ou = "\n\n".join(
                 x for x in (bf_subtree, page_text or "") if (x or "").strip()
             )
-            lo, lu = _parse_betfair_exchange_lay_odds(combined_ou or page_text or "")
+            lo, lu = _parse_betfair_lay_prefer_ht(combined_ou, page_text or "", market)
             result["betfair_lay_over"] = lo
             result["betfair_lay_under"] = lu
             if not lo and not lu:
                 from bs4 import BeautifulSoup
 
-                lo2, lu2 = _parse_betfair_exchange_lay_odds(
-                    BeautifulSoup((await page.content()) or "", "html.parser").get_text("\n")
-                )
+                html_txt = BeautifulSoup((await page.content()) or "", "html.parser").get_text("\n")
+                lo2, lu2 = _parse_betfair_lay_prefer_ht(html_txt, "", market)
                 if lo2:
                     result["betfair_lay_over"] = lo2
                 if lu2:
@@ -1706,7 +2020,7 @@ async def scrape_match(
                     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                     await asyncio.sleep(2)
                 page_text_full = await page.evaluate("() => document.body.innerText")
-                lo, lu = _parse_betfair_exchange_lay_odds(page_text_full or "")
+                lo, lu = _parse_betfair_lay_prefer_ht(page_text_full or "", "", market)
                 if lo:
                     result["betfair_lay_over"] = lo
                 if lu:
@@ -2112,6 +2426,14 @@ async def main(run_config: ScraperConfig | None = None, progress_cb=None):
             total_estimate = target_matches or min(99999, len(page_order) * 55)
             scrape_start_time = None  # set when we start processing first match
 
+            if target_matches and len(league_results) >= target_matches:
+                print(
+                    f"  CSV already has {len(league_results)} row(s) and match limit is {target_matches}. "
+                    f"No new URLs will be scraped (limit reached). "
+                    f"Use Fresh run in the GUI or delete the league CSV to fetch a new top-{target_matches} list.",
+                    flush=True,
+                )
+
             while page_idx < len(page_order) and len(league_results) < (target_matches or 99999):
                 if _check_stop():
                     print("  Stop requested. Exiting.", flush=True)
@@ -2225,11 +2547,7 @@ async def main(run_config: ScraperConfig | None = None, progress_cb=None):
                         more = _merge_match_rows_by_url(
                             more, extract_matches_from_embedded_urls(html, league_url, league_name)
                         )
-                        seen = {m["match_url"] for m in matches}
-                        for m in more:
-                            if m["match_url"] not in seen:
-                                matches.append(m)
-                                seen.add(m["match_url"])
+                        matches = _merge_match_rows_by_url(matches, more)
                         if len(matches) == prev_count:
                             if prev_count > 0:
                                 break
@@ -2251,29 +2569,45 @@ async def main(run_config: ScraperConfig | None = None, progress_cb=None):
 
                     # Keep only matches from THIS league
                     matches = [m for m in matches if _match_url_belongs_to_league(m.get("match_url", ""), league_url)]
-                    # Newest-first + limit: optional DOM order on page 1, then always sort by parsed date.
-                    if page_num == 1 and not oldest_first and run_config and target_matches:
+                    _n_before_played = len(matches)
+                    _any_ft = any(_match_row_has_final_score(m) for m in matches)
+                    if _any_ft:
+                        matches = [m for m in matches if _match_row_has_final_score(m)]
+                        _skipped_upcoming = _n_before_played - len(matches)
+                        if _skipped_upcoming:
+                            print(
+                                f"  Excluded {_skipped_upcoming} not-yet-played listing(s) (no FT score on row — e.g. upcoming).",
+                                flush=True,
+                            )
+                    elif _n_before_played:
+                        print(
+                            "  Warning: listing parse has no FT scores — cannot filter upcoming vs finished. "
+                            "Prefer /results/ and wait for the page to load, or scores may be mixed.",
+                            flush=True,
+                        )
+                    # Newest-first: sort by date (newest first), tie-break with main-column DOM order (page 1 = site list order).
+                    dom_rank: dict[str, int] = {}
+                    if page_num == 1 and not oldest_first:
                         try:
                             dom_order = await collect_h2h_matches_ordered(page, league_url, league_name)
-                            if dom_order:
-                                by_url = {m["match_url"]: m for m in matches}
-                                reordered: list[dict] = []
-                                seen_r: set[str] = set()
-                                for row in dom_order:
-                                    u = row["match_url"]
-                                    if u in by_url and u not in seen_r:
-                                        reordered.append(by_url[u])
-                                        seen_r.add(u)
-                                for m in matches:
-                                    if m["match_url"] not in seen_r:
-                                        reordered.append(m)
-                                matches = reordered
+                            dom_rank = {row["match_url"]: i for i, row in enumerate(dom_order)}
                         except Exception:
-                            pass
+                            dom_rank = {}
+
                     if not oldest_first:
-                        matches.sort(key=_dict_match_date_sort_key, reverse=True)
+                        def _match_sort_key(m: dict) -> tuple:
+                            dt = _parse_match_datetime(m.get("date") or "")
+                            r = dom_rank.get(m.get("match_url", ""), 10_000)
+                            if dt is None:
+                                return (1, 0.0, r)
+                            return (0, -dt.timestamp(), r)
+
+                        matches.sort(key=_match_sort_key)
                     else:
-                        matches.sort(key=_dict_match_date_sort_key)
+                        _sent = datetime(9999, 12, 31, 23, 59, 59)
+                        matches.sort(
+                            key=lambda m: _parse_match_datetime(m.get("date") or "") or _sent,
+                        )
 
                     if not matches and page_num == 1 and empty_attempt == 0:
                         try:
@@ -2327,6 +2661,12 @@ async def main(run_config: ScraperConfig | None = None, progress_cb=None):
                         pass
                     else:
                         break
+                # Home = left on screen; HTML/BeautifulSoup order can differ from visual flex order.
+                if matches:
+                    try:
+                        await enrich_match_teams_from_results_layout(page, matches)
+                    except Exception as ex:
+                        print(f"  Note: layout team enrichment failed: {ex}", flush=True)
                 # Filter to only matches we haven't scraped yet
                 to_scrape = [
                     m for m in matches
@@ -2373,13 +2713,11 @@ async def main(run_config: ScraperConfig | None = None, progress_cb=None):
                             lines = [l.strip() for l in text.split("\n") if l.strip()]
                             score_ft = next((l for l in lines if re.match(r"^\d{1,2}[:\-]\d{1,2}$", l) and _is_likely_score(l)), "")
                             date_val = next((l for l in lines if re.match(r"[\d]{2}[/.-][\d]{2}", l)), "")
-                            slug_parts = url.rstrip("/").split("/")[-1].rsplit("-", 1)[0].replace("-", " ").split()
-                            home = " ".join(slug_parts[: len(slug_parts) // 2]).title() if slug_parts else "?"
-                            away = " ".join(slug_parts[len(slug_parts) // 2 :]).title() if slug_parts else "?"
+                            # Slug word-split order is not home/away; teams filled at scrape time.
                             matches.append({
                                 "date": date_val,
-                                "home_team": home,
-                                "away_team": away,
+                                "home_team": "?",
+                                "away_team": "?",
                                 "score_ft": score_ft,
                                 "score_ht": "",
                                 "match_url": url,
@@ -2406,8 +2744,8 @@ async def main(run_config: ScraperConfig | None = None, progress_cb=None):
                 limit_run = config.MAX_MATCHES_PER_RUN
                 take = len(to_scrape)
                 if target_matches:
-                    complete_n = sum(1 for r in league_results if not _match_row_incomplete(r))
-                    take = min(take, max(0, target_matches - complete_n))
+                    # Slots left until row cap (same rule as outer while) — not "complete rows only"
+                    take = min(take, max(0, target_matches - len(league_results)))
                 if limit_run:
                     take = min(take, max(0, limit_run - total_new_this_run))
                 to_process = to_scrape[:take] if take > 0 else []
@@ -2424,7 +2762,7 @@ async def main(run_config: ScraperConfig | None = None, progress_cb=None):
                     # Skip non-league matches (failsafe before scrape)
                     if not _match_url_belongs_to_league(m.get("match_url", ""), league_url):
                         continue
-                    print(f"  [{i+1}/{len(to_process)}] {m.get('home_team')} vs {m.get('away_team')}", flush=True)
+                    print(f"  [{i+1}/{len(to_process)}] {_match_listing_log_label(m)}", flush=True)
                     sp = None
                     if screenshot_dir:
                         match_id = m["match_url"].rstrip("/").split("/")[-1].replace("/", "_")
@@ -2464,24 +2802,55 @@ async def main(run_config: ScraperConfig | None = None, progress_cb=None):
                     if not _match_url_belongs_to_league(m.get("match_url", ""), league_url):
                         continue
 
-                    # Merge: prefer match page data for date
-                    date_val = api_result.get("date") or m.get("date", "")
-                    score_ft = api_result.get("score_ft") or m.get("score_ft", "")
-                    score_ht = api_result.get("score_ht") or m.get("score_ht", "")
+                    # Merge: normalize format for CSV.
+                    # /h2h/... pages show many past meetings; scrape_match fills score/date from the *first*
+                    # "Final result" in page text — often a random old fixture, not the league row you scraped.
+                    # Prefer the results-listing row for FT/HT/date/teams when URL is h2h and the list had them.
+                    mu_merge = m.get("match_url", "")
+                    is_h2h = "/h2h/" in mu_merge.lower()
+                    listing_date = (m.get("date") or "").strip()
+                    listing_sft = (m.get("score_ft") or "").strip()
+                    listing_sht = (m.get("score_ht") or "").strip()
+
+                    if is_h2h and listing_sft:
+                        score_ft = listing_sft
+                        score_ht = listing_sht or (api_result.get("score_ht") or "")
+                    else:
+                        score_ft = api_result.get("score_ft") or m.get("score_ft", "")
+                        score_ht = api_result.get("score_ht") or m.get("score_ht", "")
+
+                    if is_h2h and listing_date:
+                        date_val = normalize_match_date_field(listing_date)
+                    else:
+                        date_val = normalize_match_date_field(
+                            api_result.get("date") or m.get("date") or "",
+                        )
+
                     ft_home, ft_away = _parse_score(score_ft)
                     ht_home, ht_away = _parse_score(score_ht)
 
-                    fix_home, fix_away = teams_from_match_url(m.get("match_url", ""))
-                    home_team = (
-                        api_result.get("home_team")
-                        or m.get("home_team")
-                        or (fix_home if fix_home != "?" else "")
-                    )
-                    away_team = (
-                        api_result.get("away_team")
-                        or m.get("away_team")
-                        or (fix_away if fix_away != "?" else "")
-                    )
+                    fix_home, fix_away = teams_from_match_url(mu_merge)
+                    listing_home = (m.get("home_team") or "").strip()
+                    listing_away = (m.get("away_team") or "").strip()
+                    listing_teams_ok = listing_home and listing_away and listing_home != "?" and listing_away != "?"
+                    if is_h2h and listing_teams_ok:
+                        home_team = listing_home or api_result.get("home_team") or (
+                            fix_home if fix_home != "?" else ""
+                        )
+                        away_team = listing_away or api_result.get("away_team") or (
+                            fix_away if fix_away != "?" else ""
+                        )
+                    else:
+                        home_team = (
+                            api_result.get("home_team")
+                            or m.get("home_team")
+                            or (fix_home if fix_home != "?" else "")
+                        )
+                        away_team = (
+                            api_result.get("away_team")
+                            or m.get("away_team")
+                            or (fix_away if fix_away != "?" else "")
+                        )
 
                     new_row = MatchData(
                         date=date_val,
@@ -2518,14 +2887,27 @@ async def main(run_config: ScraperConfig | None = None, progress_cb=None):
                         elapsed = time.time() - scrape_start_time
                         rate = done / elapsed if elapsed > 0 else 0
                         eta_sec = (total_estimate - done) / rate if rate > 0.1 else None
-                        _report_progress(progress_cb, pct, f"{done}/{total_estimate} — {m.get('home_team','')} vs {m.get('away_team','')}", eta_sec)
+                        _report_progress(
+                            progress_cb,
+                            pct,
+                            f"{done}/{total_estimate} — {_match_listing_log_label(m)}",
+                            eta_sec,
+                        )
                     else:
-                        _report_progress(progress_cb, None, f"{done} scraped — {m.get('home_team','')} vs {m.get('away_team','')}", None)
+                        _report_progress(
+                            progress_cb,
+                            None,
+                            f"{done} scraped — {_match_listing_log_label(m)}",
+                            None,
+                        )
                     # Incremental save every 10 matches + progress file
-                    progress_file.write_text(f"{len(league_results)} total - {m.get('home_team', '')} vs {m.get('away_team', '')}\nLast update: {time.strftime('%H:%M:%S')}", encoding="utf-8")
+                    progress_file.write_text(
+                        f"{len(league_results)} total - {_match_listing_log_label(m)}\nLast update: {time.strftime('%H:%M:%S')}",
+                        encoding="utf-8",
+                    )
                     if (len(league_results)) % 10 == 0:
                         import pandas as pd
-                        _sort_results_chronological(league_results)
+                        _sort_results_for_export(league_results, oldest_first=oldest_first)
                         df = pd.DataFrame([asdict(r) for r in league_results])
                         try:
                             with open(out_dir / f"{slug}.csv", "w", newline="", encoding="utf-8") as f:
@@ -2537,13 +2919,15 @@ async def main(run_config: ScraperConfig | None = None, progress_cb=None):
                     # Stop if we hit per-run limit
                     if limit_run and total_new_this_run >= limit_run:
                         break
+                    if target_matches and len(league_results) >= target_matches:
+                        break
 
                 page_idx += 1
 
-            # Final export per league (after all batches) - always chronological order
+            # Final export: order matches scrape direction (newest-first → most recent at top of CSV).
             if league_results:
                 import pandas as pd
-                _sort_results_chronological(league_results)
+                _sort_results_for_export(league_results, oldest_first=oldest_first)
                 df = pd.DataFrame([asdict(r) for r in league_results])
                 csv_path = out_dir / f"{slug}.csv"
                 xlsx_path = out_dir / f"{slug}.xlsx"

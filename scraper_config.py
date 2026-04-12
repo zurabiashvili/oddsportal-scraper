@@ -11,7 +11,7 @@ class ScraperConfig:
     league_urls: list[str]  # Up to 12 URLs; processed sequentially (queue)
     market: Literal["ft", "ht"]  # Full Time or Half Time
     line: Literal[0.5, 1.5, 2.5]  # Over/Under goals line
-    match_limit: int | None  # None = full season, else first N matches
+    match_limit: int | None  # None = full season; else max total rows in CSV (resume counts existing rows)
     direction: Literal["newest", "oldest"]  # Newest first (page 1→) or oldest first (last page→)
     fresh_run: bool = False  # True = start empty and overwrite; False = resume from existing CSV
 
