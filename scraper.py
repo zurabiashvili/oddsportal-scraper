@@ -84,26 +84,27 @@ def _match_row_incomplete(md: MatchData) -> bool:
 
 
 def _parse_match_datetime(s: str) -> datetime | None:
-    """Parse OddsPortal date strings (incl. 'Today, 11 Apr' and messy newlines) for sort/export."""
+    """Parse OddsPortal date strings (incl. 'Today, 11 Apr', 'Yesterday, 10 Apr', weekday headers) for sort/export."""
     if not s:
         return None
     s = re.sub(r"\s+", " ", str(s).strip().replace("\n", " "))[:120].strip()
     if not s:
         return None
-    if re.match(r"(?i)today\s*,", s):
-        m = re.search(
-            r"(?i)today\s*,\s*(\d{1,2}\s+[A-Za-z]{3})(?:\s+(\d{4}))?(?:\s*,\s*(\d{1,2}:\d{2}))?",
-            s,
-        )
-        if m:
-            dpart, year_s, tim = m.group(1), m.group(2), m.group(3)
-            year = int(year_s) if year_s else date.today().year
-            try:
-                if tim:
-                    return datetime.strptime(f"{dpart} {year} {tim}", "%d %b %Y %H:%M")
-                return datetime.strptime(f"{dpart} {year}", "%d %b %Y")
-            except ValueError:
-                pass
+    # Results page grey bars: "Today, 11 Apr", "Yesterday, 10 Apr", "Friday, 11 Apr" (day/month explicit)
+    m = re.search(
+        r"(?i)(?:Today|Yesterday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\s*,\s*"
+        r"(\d{1,2}\s+[A-Za-z]{3})(?:\s+(\d{4}))?(?:\s*,\s*(\d{1,2}:\d{2}))?",
+        s,
+    )
+    if m:
+        dpart, year_s, tim = m.group(1), m.group(2), m.group(3)
+        year = int(year_s) if year_s else date.today().year
+        try:
+            if tim:
+                return datetime.strptime(f"{dpart} {year} {tim}", "%d %b %Y %H:%M")
+            return datetime.strptime(f"{dpart} {year}", "%d %b %Y")
+        except ValueError:
+            pass
     for fmt in (
         "%d %b %Y, %H:%M",
         "%d %b %Y",
@@ -1092,6 +1093,45 @@ def _match_row_has_final_score(m: dict) -> bool:
     return _is_likely_score(s.replace("-", ":"))
 
 
+def _normalize_href_for_match(href: str) -> str:
+    """Stable key for comparing match <a href> across parsers (identity on Tag objects is unreliable)."""
+    h = (href or "").strip().split("?")[0].split("#")[0]
+    if h.startswith("/"):
+        h = f"https://www.oddsportal.com{h}"
+    elif h and not h.startswith("http"):
+        h = f"https://www.oddsportal.com/{h.lstrip('/')}"
+    return h.rstrip("/").lower()
+
+
+def _find_section_date_before_anchor_soup(soup, anchor) -> str:
+    """Last section header ('Today, 11 Apr', 'Yesterday, 10 Apr') before this link in **document order**.
+
+    OddsPortal puts the bar outside the row; sibling-walking misses it. Tree order matches the page.
+    Match by **href**, not ``el is anchor`` — BeautifulSoup can break object identity across traversals.
+    """
+    header_re = re.compile(
+        r"(?i)^(Today|Yesterday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\s*,\s*\d{1,2}\s+[A-Za-z]{3}\s*$"
+    )
+    want = _normalize_href_for_match(anchor.get("href", ""))
+    if not want:
+        return ""
+    current = ""
+    for el in soup.find_all(True):
+        if el.name == "a" and _normalize_href_for_match(el.get("href", "")) == want:
+            return current
+        try:
+            text = el.get_text("\n", strip=True)
+        except (AttributeError, TypeError):
+            continue
+        if len(text) > 120:
+            continue
+        for line in text.split("\n"):
+            ln = line.strip()
+            if 10 <= len(ln) < 50 and header_re.match(ln):
+                current = ln
+    return current
+
+
 def parse_results_page_html(html: str, base_url: str, league_name: str) -> list[dict]:
     """Parse results page and extract match links with date, teams, scores."""
     from bs4 import BeautifulSoup
@@ -1125,18 +1165,20 @@ def parse_results_page_html(html: str, base_url: str, league_name: str) -> list[
         if row_teams_ok:
             home, away = ha, aw
 
+        # Date sits in a grey section bar above the block — use document order, not sibling walk.
+        date_val = _find_section_date_before_anchor_soup(soup, a)
         parent = a.parent
-        date_val, score_ft, score_ht = "", "", ""
+        score_ft, score_ht = "", ""
         for _ in range(10):
             if parent is None:
                 break
             text = parent.get_text(separator="\n").strip()
             lines = [l.strip() for l in text.split("\n") if l.strip()]
             for line in lines:
-                if re.match(r"(?i)today\s*,\s*\d{1,2}\s+[A-Za-z]{3}", line):
-                    date_val = line
-                elif re.match(
-                    r"[\d]{2}[/.-][\d]{2}[/.-][\d]{2,4}|[\d]{1,2}\s+[A-Za-z]+\s+[\d]{4}",
+                # Do not grab bare "13 Apr 2026" / dd/mm lines from the row — they are not the section date
+                # and often disagree with "Today, 11 Apr" in the grey bar (filled by layout enrich).
+                if not date_val and re.match(
+                    r"(?i)(?:Today|Yesterday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\s*,\s*\d{1,2}\s+[A-Za-z]{3}",
                     line,
                 ):
                     date_val = line
@@ -1144,7 +1186,7 @@ def parse_results_page_html(html: str, base_url: str, league_name: str) -> list[
                     score_ht = line.strip("()").replace("-", ":")
                 elif re.match(r"^\d{1,2}[:\-]\d{1,2}$", line) and _is_likely_score(line):
                     score_ft = line.replace("-", ":")
-            if date_val or score_ft or len(lines) >= 2:
+            if score_ft:
                 break
             parent = getattr(parent, "parent", None)
 
@@ -1233,6 +1275,22 @@ async def enrich_match_teams_from_results_layout(page, matches: list[dict]) -> N
                 if (teamish(left) && teamish(right) && left !== right) return [left, right];
                 return null;
             };
+            const sectionDateBeforeAnchor = (anchor) => {
+                const re = /^(Today|Yesterday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\\s*,\\s*\\d{1,2}\\s+[A-Za-z]{3}/i;
+                let current = null;
+                const it = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT, null);
+                let node;
+                while ((node = it.nextNode())) {
+                    if (node === anchor) return current;
+                    const t = String(node.innerText || '').trim();
+                    if (t.length > 100) continue;
+                    for (const line of t.split('\\n')) {
+                        const ln = line.trim();
+                        if (ln.length >= 10 && ln.length < 48 && re.test(ln)) current = ln;
+                    }
+                }
+                return current;
+            };
             const out = {};
             for (const matchUrl of matchUrls) {
                 const path = normPath(matchUrl);
@@ -1244,6 +1302,7 @@ async def enrich_match_teams_from_results_layout(page, matches: list[dict]) -> N
                     out[path] = null;
                     continue;
                 }
+                const dateStr = sectionDateBeforeAnchor(anchor);
                 let row = anchor.parentElement;
                 let found = null;
                 for (let depth = 0; depth < 14 && row && !found; depth++) {
@@ -1293,7 +1352,7 @@ async def enrich_match_teams_from_results_layout(page, matches: list[dict]) -> N
                     }
                     row = row.parentElement;
                 }
-                out[path] = found;
+                out[path] = { teams: found, date: dateStr };
             }
             return out;
         }""",
@@ -1309,9 +1368,16 @@ async def enrich_match_teams_from_results_layout(page, matches: list[dict]) -> N
         if not url:
             continue
         key = urlparse(url).path.rstrip("/")
-        pair = raw.get(key)
-        if pair is None:
-            pair = raw.get(key + "/")
+        val = raw.get(key)
+        if val is None:
+            val = raw.get(key + "/")
+        pair = None
+        dstr = None
+        if isinstance(val, dict):
+            pair = val.get("teams")
+            dstr = val.get("date")
+        elif isinstance(val, (list, tuple)):
+            pair = val
         if (
             isinstance(pair, (list, tuple))
             and len(pair) == 2
@@ -1321,6 +1387,8 @@ async def enrich_match_teams_from_results_layout(page, matches: list[dict]) -> N
         ):
             m["home_team"] = str(pair[0]).strip()
             m["away_team"] = str(pair[1]).strip()
+        if dstr and str(dstr).strip():
+            m["date"] = str(dstr).strip()
 
 
 def extract_matches_from_embedded_urls(html: str, league_url: str, league_name: str) -> list[dict]:
@@ -2753,7 +2821,10 @@ async def main(run_config: ScraperConfig | None = None, progress_cb=None):
                 if to_process and scrape_start_time is None:
                     scrape_start_time = time.time()
 
+                _row_by_url = {x.get("match_url"): x for x in matches if x.get("match_url")}
                 for i, m in enumerate(to_process):
+                    # _merge_match_rows_by_url can replace dicts in `matches`; always use the live row.
+                    m = _row_by_url.get(m.get("match_url", ""), m)
                     if _check_stop():
                         print("  Stop requested. Exiting.", flush=True)
                         break
@@ -2805,7 +2876,7 @@ async def main(run_config: ScraperConfig | None = None, progress_cb=None):
                     # Merge: normalize format for CSV.
                     # /h2h/... pages show many past meetings; scrape_match fills score/date from the *first*
                     # "Final result" in page text — often a random old fixture, not the league row you scraped.
-                    # Prefer the results-listing row for FT/HT/date/teams when URL is h2h and the list had them.
+                    # Prefer the results-listing row for FT/HT when URL is h2h and the list had them.
                     mu_merge = m.get("match_url", "")
                     is_h2h = "/h2h/" in mu_merge.lower()
                     listing_date = (m.get("date") or "").strip()
@@ -2819,7 +2890,9 @@ async def main(run_config: ScraperConfig | None = None, progress_cb=None):
                         score_ft = api_result.get("score_ft") or m.get("score_ft", "")
                         score_ht = api_result.get("score_ht") or m.get("score_ht", "")
 
-                    if is_h2h and listing_date:
+                    # Fixture date: trust the results page section ("Today, 11 Apr") — match pages often show
+                    # kick-off or other lines that disagree with the list.
+                    if listing_date:
                         date_val = normalize_match_date_field(listing_date)
                     else:
                         date_val = normalize_match_date_field(
