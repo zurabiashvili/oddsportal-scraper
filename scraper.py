@@ -12,7 +12,7 @@ import asyncio
 import csv
 import re
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
@@ -144,6 +144,148 @@ def _sort_results_for_export(results: list, oldest_first: bool) -> None:
 def _sort_results_chronological(results: list) -> None:
     """Backward-compatible: oldest match first."""
     _sort_results_for_export(results, oldest_first=True)
+
+
+# CSV/XLSX template: row 1 headers; G2 = % of matches with ≥1 HT goal; A3 = match count; rows 4–10 blank; data from row 11.
+EXPORT_TEMPLATE_G_HEADER = "AVG % of matches with at least one goal"
+
+
+def _export_template_headers() -> list[str]:
+    return [
+        "Date",
+        "Home Team",
+        "Away Team",
+        "HT Home Goals",
+        "HT Away Goals",
+        "HT Goals",
+        EXPORT_TEMPLATE_G_HEADER,
+        "match_url",
+        "full_time_home",
+        "full_time_away",
+        "over_odds",
+        "under_odds",
+        "betfair_lay_over",
+        "betfair_lay_under",
+        "league",
+    ]
+
+
+def _match_ht_total_int(md: MatchData) -> int | None:
+    """Parsed HT total goals, or None if not available."""
+    try:
+        t = (md.half_time_total or "").strip()
+        if t:
+            return int(t)
+    except (ValueError, TypeError):
+        pass
+    try:
+        h = (md.half_time_home or "").strip()
+        a = (md.half_time_away or "").strip()
+        if h and a:
+            return int(h) + int(a)
+    except (ValueError, TypeError):
+        pass
+    return None
+
+
+def _pct_matches_ht_at_least_one(matches: list[MatchData]) -> str:
+    n = len(matches)
+    if n == 0:
+        return "0.0%"
+    with_goal = sum(
+        1 for m in matches if (t := _match_ht_total_int(m)) is not None and t >= 1
+    )
+    return f"{100.0 * with_goal / n:.1f}%"
+
+
+def _date_to_dd_mm_yyyy(raw: str) -> str:
+    dt = _parse_match_datetime(raw or "")
+    if dt:
+        return dt.strftime("%d/%m/%Y")
+    return ""
+
+
+def _ht_cell_int_str(s: str) -> str:
+    if not (s or "").strip():
+        return ""
+    try:
+        return str(int(str(s).strip()))
+    except (ValueError, TypeError):
+        return ""
+
+
+def _match_data_to_template_row(md: MatchData) -> list[str]:
+    t_int = _match_ht_total_int(md)
+    ht_goals = str(t_int) if t_int is not None else ""
+    return [
+        _date_to_dd_mm_yyyy(md.date),
+        md.home_team,
+        md.away_team,
+        _ht_cell_int_str(md.half_time_home),
+        _ht_cell_int_str(md.half_time_away),
+        ht_goals,
+        "",
+        md.match_url,
+        md.full_time_home,
+        md.full_time_away,
+        md.over_odds or "",
+        md.under_odds or "",
+        md.betfair_lay_over or "",
+        md.betfair_lay_under or "",
+        md.league,
+    ]
+
+
+def _write_matches_template_csv(path: Path, league_results: list[MatchData]) -> None:
+    """Write CSV: summary in rows 1–3, blank rows 4–10, match rows from row 11 (columns H+ hold resume fields)."""
+    headers = _export_template_headers()
+    ncol = len(headers)
+    pct = _pct_matches_ht_at_least_one(league_results)
+    n = len(league_results)
+    empty = [""] * ncol
+    row2 = empty.copy()
+    row2[6] = pct
+    row3 = empty.copy()
+    row3[0] = str(n)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(headers)
+        w.writerow(row2)
+        w.writerow(row3)
+        for _ in range(7):
+            w.writerow(empty)
+        for md in league_results:
+            w.writerow(_match_data_to_template_row(md))
+
+
+def _write_matches_template_xlsx(path: Path, league_results: list[MatchData]) -> None:
+    """Same layout as CSV for Excel."""
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    headers = _export_template_headers()
+    for c, h in enumerate(headers, start=1):
+        ws.cell(row=1, column=c, value=h)
+    ws.cell(row=2, column=7, value=_pct_matches_ht_at_least_one(league_results))
+    ws.cell(row=3, column=1, value=len(league_results))
+    r = 11
+    for md in league_results:
+        for c, val in enumerate(_match_data_to_template_row(md), start=1):
+            ws.cell(row=r, column=c, value=val if val != "" else None)
+        r += 1
+    wb.save(path)
+
+
+def _read_results_dataframe(csv_path: Path):
+    """Load dataframe from legacy flat CSV or new template CSV (summary rows + data from row 11)."""
+    import pandas as pd
+
+    with open(csv_path, encoding="utf-8") as f:
+        line1 = f.readline()
+    if "Home Team" in line1 and "Away Team" in line1:
+        return pd.read_csv(csv_path, header=0, skiprows=range(1, 10))
+    return pd.read_csv(csv_path, header=0)
 
 
 def _normalize_eu_odds_text(s: str) -> str:
@@ -2184,18 +2326,22 @@ def _load_existing_results(out_dir: Path, slug: str, league_url: str = "") -> tu
         return [], set()
     try:
         import pandas as pd
-        df = pd.read_csv(csv_path)
+        df = _read_results_dataframe(csv_path)
         results = []
         seen = set()
         complete_urls: set[str] = set()
-        def _opt(row, col, default=""):
-            if col not in df.columns:
-                return default
-            v = row.get(col)
-            if pd.isna(v):
-                return default
-            s = str(v).strip()
-            return default if not s or s.lower() == "nan" else s
+
+        def _opt(row, *cols, default=""):
+            for col in cols:
+                if col not in df.columns:
+                    continue
+                v = row.get(col)
+                if pd.isna(v):
+                    continue
+                s = str(v).strip()
+                if s and s.lower() != "nan":
+                    return s
+            return default
 
         for _, row in df.iterrows():
             url = _opt(row, "match_url", "")
@@ -2204,21 +2350,21 @@ def _load_existing_results(out_dir: Path, slug: str, league_url: str = "") -> tu
             if league_url and not _match_url_belongs_to_league(url, league_url):
                 continue
             seen.add(url)
-            o15 = _opt(row, "over_odds", "") or _opt(row, "over_15_odds", "")
-            u15 = _opt(row, "under_odds", "") or _opt(row, "under_15_odds", "")
-            bfo = _opt(row, "betfair_lay_over", "") or _opt(row, "betfair_lay_over_15", "")
-            bfu = _opt(row, "betfair_lay_under", "") or _opt(row, "betfair_lay_under_15", "")
-            hth = _opt(row, "half_time_home", "")
-            hta = _opt(row, "half_time_away", "")
-            htt = _opt(row, "half_time_total", "") or _opt(row, "half_time_total_goals", "")
+            o15 = _opt(row, "over_odds", "over_15_odds", default="")
+            u15 = _opt(row, "under_odds", "under_15_odds", default="")
+            bfo = _opt(row, "betfair_lay_over", "betfair_lay_over_15", default="")
+            bfu = _opt(row, "betfair_lay_under", "betfair_lay_under_15", default="")
+            hth = _opt(row, "HT Home Goals", "half_time_home", default="")
+            hta = _opt(row, "HT Away Goals", "half_time_away", default="")
+            htt = _opt(row, "HT Goals", "half_time_total", "half_time_total_goals", default="")
             if not htt:
                 htt = _half_time_total_goals(hth, hta)
             md = MatchData(
-                date=_opt(row, "date", ""),
-                home_team=_opt(row, "home_team", ""),
-                away_team=_opt(row, "away_team", ""),
-                full_time_home=_opt(row, "full_time_home", ""),
-                full_time_away=_opt(row, "full_time_away", ""),
+                date=_opt(row, "Date", "date", default=""),
+                home_team=_opt(row, "Home Team", "home_team", default=""),
+                away_team=_opt(row, "Away Team", "away_team", default=""),
+                full_time_home=_opt(row, "full_time_home", default=""),
+                full_time_away=_opt(row, "full_time_away", default=""),
                 half_time_home=hth,
                 half_time_away=hta,
                 half_time_total=htt,
@@ -2979,12 +3125,9 @@ async def main(run_config: ScraperConfig | None = None, progress_cb=None):
                         encoding="utf-8",
                     )
                     if (len(league_results)) % 10 == 0:
-                        import pandas as pd
                         _sort_results_for_export(league_results, oldest_first=oldest_first)
-                        df = pd.DataFrame([asdict(r) for r in league_results])
                         try:
-                            with open(out_dir / f"{slug}.csv", "w", newline="", encoding="utf-8") as f:
-                                df.to_csv(f, index=False)
+                            _write_matches_template_csv(out_dir / f"{slug}.csv", league_results)
                         except PermissionError:
                             pass
                     time.sleep(config.DELAY_BETWEEN_REQUESTS)
@@ -2999,26 +3142,22 @@ async def main(run_config: ScraperConfig | None = None, progress_cb=None):
 
             # Final export: order matches scrape direction (newest-first → most recent at top of CSV).
             if league_results:
-                import pandas as pd
                 _sort_results_for_export(league_results, oldest_first=oldest_first)
-                df = pd.DataFrame([asdict(r) for r in league_results])
                 csv_path = out_dir / f"{slug}.csv"
                 xlsx_path = out_dir / f"{slug}.xlsx"
                 for path in (csv_path, xlsx_path):
                     try:
                         if path.suffix == ".csv":
-                            with open(path, "w", newline="", encoding="utf-8") as f:
-                                df.to_csv(f, index=False)
+                            _write_matches_template_csv(path, league_results)
                         else:
-                            df.to_excel(path, index=False, engine="openpyxl")
+                            _write_matches_template_xlsx(path, league_results)
                         print(f"Exported to {path}")
                     except PermissionError:
                         alt = path.parent / f"{path.stem}_new{path.suffix}"
                         if path.suffix == ".csv":
-                            with open(alt, "w", newline="", encoding="utf-8") as f:
-                                df.to_csv(f, index=False)
+                            _write_matches_template_csv(alt, league_results)
                         else:
-                            df.to_excel(alt, index=False, engine="openpyxl")
+                            _write_matches_template_xlsx(alt, league_results)
                         print(f"  (original file locked) Saved to {alt}")
                 print(f"\nExported {len(league_results)} matches.")
             else:
