@@ -4,3 +4,5 @@ __pycache__/
 output/
 debug_*.html
 debug_*.txt
+debug_*.png
+_tmp_results.html
