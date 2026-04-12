@@ -15,7 +15,7 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
@@ -56,6 +56,33 @@ class MatchData:
     league: str
 
 
+def _match_row_incomplete(md: MatchData) -> bool:
+    """True if we should open the match page: no result yet, or finished match but all odds columns still empty.
+
+    Without the odds check, resume would skip match pages as soon as date+score existed — leaving odds forever empty.
+    """
+
+    def _empty(x: str | None) -> bool:
+        if x is None:
+            return True
+        s = str(x).strip()
+        return not s or s.lower() == "nan"
+
+    no_date = not (md.date or "").strip()
+    no_ft = not (md.full_time_home or "").strip()
+    if no_date and no_ft:
+        return True
+    has_ft = bool((md.full_time_home or "").strip())
+    if not has_ft:
+        return False
+    return (
+        _empty(md.over_odds)
+        and _empty(md.under_odds)
+        and _empty(md.betfair_lay_over)
+        and _empty(md.betfair_lay_under)
+    )
+
+
 def _date_sort_key(m: MatchData) -> tuple:
     """Return sort key for chronological order (oldest first). Unparseable dates go last."""
     s = re.sub(r"\s+", " ", (m.date or "").strip().replace("\n", " "))[:50]
@@ -83,25 +110,65 @@ def _dict_match_date_sort_key(m: dict) -> datetime:
     return datetime.min
 
 
+def _normalize_eu_odds_text(s: str) -> str:
+    """OddsPortal often uses comma as decimal separator (e.g. 1,85). Normalize for regex/float parsing."""
+    if not s:
+        return s
+
+    def repl(m) -> str:
+        a, b = m.group(1), m.group(2)
+        try:
+            v = float(f"{a}.{b}")
+            if 1.01 <= v <= 100.0:
+                return f"{a}.{b}"
+        except ValueError:
+            pass
+        return m.group(0)
+
+    return re.sub(r"(?<!\d)(\d+),(\d{2})\b", repl, s)
+
+
+def _normalize_oddsportal_netloc(url: str) -> str:
+    """Use www.oddsportal.com — storage_state cookies and exchange odds match that host; bare oddsportal.com does not."""
+    if not (url or "").strip():
+        return url
+    try:
+        p = urlparse(url.strip())
+        host = (p.netloc or "").lower()
+        if host in ("oddsportal.com", "m.oddsportal.com"):
+            return urlunparse(
+                (
+                    p.scheme or "https",
+                    "www.oddsportal.com",
+                    p.path,
+                    p.params,
+                    p.query,
+                    p.fragment,
+                )
+            )
+    except Exception:
+        pass
+    return url
+
+
+def _betting_exchanges_block_start(low_full: str) -> int:
+    """Index of the main odds-table block (last occurrence — nav/footer can mention Betfair earlier)."""
+    for key in ("betting exchanges", "betfair exchange"):
+        i = low_full.rfind(key)
+        if i >= 0:
+            return i
+    return low_full.rfind("betfair")
+
+
 def _parse_betfair_exchange_lay_odds(page_text: str) -> tuple[str | None, str | None]:
-    """Lay Over/Under from the Betting Exchanges → Betfair table only (after Back row, not main bookmakers)."""
+    """Lay Over/Under from the Betting Exchanges → Betfair block (not main bookmakers)."""
     if not page_text:
         return None, None
-    low = page_text.lower()
-    idx = low.find("betting exchanges")
-    if idx < 0:
-        idx = low.find("betfair exchange")
-    if idx < 0:
-        return None, None
-    block = page_text[idx : idx + 6500]
-    # Use the last 'Lay' in this block so we don't pick bookmaker rows above the exchange widget.
-    lay_pos = block.rfind("Lay")
-    if lay_pos < 0:
-        return None, None
-    tail = block[lay_pos : lay_pos + 900]
+    page_text = _normalize_eu_odds_text(page_text)
 
     def _parse_o_u(o_raw: str, u_raw: str) -> tuple[str | None, str | None]:
-        o_raw, u_raw = o_raw.strip(), u_raw.strip()
+        o_raw = re.sub(r"\s*\([^)]*\)\s*$", "", o_raw.strip())
+        u_raw = re.sub(r"\s*\([^)]*\)\s*$", "", u_raw.strip())
         lo = None
         if o_raw and o_raw not in ("-", "–", "−", "—") and re.match(r"\d", o_raw):
             try:
@@ -117,14 +184,141 @@ def _parse_betfair_exchange_lay_odds(page_text: str) -> tuple[str | None, str | 
             pass
         return lo, lu
 
+    # Grid layout: column headers Over|Under once; rows "Back" then "Lay" with stacked numbers.
+    # Typical: Back 1.43 (73) 3.15 (33) 98.4%  then  Lay - 3.35 (42) 335.0%  (Lay Over, Lay Under, vol, payout%).
     for pat in (
+        r"(?is)\bBack\b[\s\S]{0,800}?\bLay\b[\s\S]{0,2500}?"
+        r"([\d.]+)\s*\([^)]*\)\s*([\d.]+)\s*\([^)]*\)\s*[\d.]+%\s*([-–−]|[\d.]+)\s*([\d.]+)\s*\([^)]*\)\s*[\d.]+%",
+        r"(?is)(?:Betfair\s+Exchange|Betting\s+Exchanges)[\s\S]{0,12000}?\bBack\b[\s\S]{0,800}?\bLay\b[\s\S]{0,2500}?"
+        r"([\d.]+)\s*\([^)]*\)\s*([\d.]+)\s*\([^)]*\)\s*[\d.]+%\s*([-–−]|[\d.]+)\s*([\d.]+)\s*\([^)]*\)\s*[\d.]+%",
+    ):
+        m = re.search(pat, page_text)
+        if m:
+            lo, lu = _parse_o_u(m.group(3), m.group(4))
+            if lo or lu:
+                return lo, lu
+
+    # Prefer the last "Betting Exchanges" block — earlier mentions can be nav/footer.
+    low_full = page_text.lower()
+    ai = _betting_exchanges_block_start(low_full)
+    if ai >= 0:
+        sub = page_text[ai : ai + 40000]
+        # Betfair: "Back" row then "Lay" row — Lay Over may be "-" while Lay Under has the price (e.g. 4.50).
+        for rx in (
+            r"(?is)\bLay\b[\s\S]{0,8000}?\bOver\b\s+(\S+)\s+\bUnder\b\s+(\S+)",
+            r"(?is)\bLay\b[\s\S]{0,8000}?\bOver\b\s+([-–−\d.]+)\s+\bUnder\b\s+([\d.,]+)",
+            r"(?is)\bLay\b[\s\S]{0,3000}?\bOver\b\s*[-–−]\s*\bUnder\b\s+(\d+[.,]\d+)",
+            r"(?i)\bLay\b\s+Over\s*([-–−\d.]+)\s+Under\s*([-\d.,]+)",
+        ):
+            matches = list(re.finditer(rx, sub))
+            if matches:
+                last = matches[-1]
+                if last.lastindex == 1:
+                    lo, lu = _parse_o_u("-", last.group(1))
+                else:
+                    lo, lu = _parse_o_u(last.group(1), last.group(2))
+                if lo or lu:
+                    return lo, lu
+
+    # Whole-page patterns (OddsPortal layout varies) — search from last Betfair block when possible
+    tail_start = max(0, len(page_text) - 120000)
+    page_tail = page_text[tail_start:]
+    for pat in (
+        r"(?is)Betting\s+Exchanges[\s\S]{0,25000}?\bLay\b[\s\S]{0,8000}?\bOver\b\s+(\S+)\s+\bUnder\b\s+(\S+)",
+        r"(?is)Betfair\s+Exchange[\s\S]{0,25000}?\bLay\b[\s\S]{0,8000}?\bOver\b\s+(\S+)\s+\bUnder\b\s+(\S+)",
+        r"(?is)Betting\s+Exchanges[\s\S]{0,25000}?\bLay\b\s+Over\s*([-–−\d.]+)\s+Under\s*([-\d.,]+)",
+        r"(?is)Betfair\s+Exchange[\s\S]{0,25000}?\bLay\b\s+Over\s*([-–−\d.]+)\s+Under\s*([-\d.,]+)",
+        r"(?is)(?:Betfair|Betting\s+Exchanges)[\s\S]{0,12000}?\bLay\b\s+Over\s*([-–−\d.]+)\s+Under\s*([-\d.,]+)",
+        r"(?is)Betfair\s+Exchange[\s\S]{0,25000}?\bLay\b[\s\S]{0,3000}?\bOver\b\s*[-–−]\s*\bUnder\b\s+(\d+[.,]\d+)",
+    ):
+        m = re.search(pat, page_tail)
+        if m:
+            if m.lastindex == 1:
+                lo, lu = _parse_o_u("-", m.group(1))
+            else:
+                lo, lu = _parse_o_u(m.group(1), m.group(2))
+            if lo or lu:
+                return lo, lu
+
+    # Responsive tables: Lay / Over / Under on separate lines
+    for pat in (
+        r"(?is)\bLay\b\s*\n\s*Over\s*\n\s*([-–−\d.]+)\s*\n\s*Under\s*\n\s*([-\d.]+)",
+        r"(?is)\bLay\b\s+Over\s*\n\s*([-–−\d.]+)\s*\n\s*Under\s*\n\s*([-\d.]+)",
+    ):
+        m = re.search(pat, page_text)
+        if m:
+            lo, lu = _parse_o_u(m.group(1), m.group(2))
+            if lo or lu:
+                return lo, lu
+
+    low = page_text.lower()
+    idx = _betting_exchanges_block_start(low)
+    if idx < 0:
+        return None, None
+    block = page_text[idx : idx + 20000]
+
+    for pat in (
+        r"(?is)\bLay\b[\s\S]{0,8000}?\bOver\b\s+(\S+)\s+\bUnder\b\s+(\S+)",
+        r"(?is)\bLay\b[\s\S]{0,8000}?\bOver\b\s+([-–−\d.]+)\s+\bUnder\b\s+([\d.,]+)",
+        r"(?is)\bLay\b[\s\S]{0,3000}?\bOver\b\s*[-–−]\s*\bUnder\b\s+(\d+[.,]\d+)",
+        r"(?is)\bLay\b\s+Over\s*([-–−\d.]+)\s+Under\s*([-\d.,]+)",
+        r"Lay\s+Over\s*([-–−]|\d+\.\d+)\s+Under\s*(\d+\.\d+)",
+        r"Lay\s+Over\s*([-–−]|\d+\.\d+)\s*\n\s*Under\s*(\d+\.\d+)",
+        r"Lay\s*\n\s*Over\s*\n\s*([-–−]|\d+\.\d+)\s*\n\s*Under\s*\n\s*(\d+\.\d+)",
+    ):
+        m = re.search(pat, block, re.I | re.DOTALL)
+        if m:
+            if m.lastindex == 1:
+                lo, lu = _parse_o_u("-", m.group(1))
+            else:
+                lo, lu = _parse_o_u(m.group(1), m.group(2))
+            if lo or lu:
+                return lo, lu
+
+    # Last word-boundary "Lay" in Betfair block (not substring of "delay")
+    lay_spans = [m.start() for m in re.finditer(r"(?i)\bLay\b", block)]
+    if not lay_spans:
+        lay_line_fb0 = re.search(
+            r"(?i)\bLay\b[^\d]{0,80}(\d+\.\d+)\s+[^\d]{0,30}(\d+\.\d+)",
+            block,
+        )
+        if lay_line_fb0:
+            try:
+                a, b = lay_line_fb0.group(1), lay_line_fb0.group(2)
+                fa, fb = float(a), float(b)
+                if 1.01 <= fa <= 50 and 1.01 <= fb <= 50:
+                    return a, b
+            except ValueError:
+                pass
+        return None, None
+    lay_pos = lay_spans[-1]
+    tail = block[lay_pos : lay_pos + 2000]
+
+    for pat in (
+        r"(?is)\bLay\b[\s\S]{0,8000}?\bOver\b\s+(\S+)\s+\bUnder\b\s+(\S+)",
+        r"(?is)\bLay\b[\s\S]{0,8000}?\bOver\b\s+([-–−\d.]+)\s+\bUnder\b\s+([\d.,]+)",
+        r"(?is)\bLay\b[\s\S]{0,3000}?\bOver\b\s*[-–−]\s*\bUnder\b\s+(\d+[.,]\d+)",
         r"Lay\s+Over\s*([-–−]|\d+\.\d+)\s+Under\s*(\d+\.\d+)",
         r"Lay\s+Over\s*([-–−]|\d+\.\d+)\s*\n\s*Under\s*(\d+\.\d+)",
         r"Lay\s*\n\s*Over\s*\n\s*([-–−]|\d+\.\d+)\s*\n\s*Under\s*\n\s*(\d+\.\d+)",
     ):
         m = re.search(pat, tail, re.I | re.DOTALL)
         if m:
+            if m.lastindex == 1:
+                return _parse_o_u("-", m.group(1))
             return _parse_o_u(m.group(1), m.group(2))
+    lay_line_fb = re.search(
+        r"(?i)\bLay\b[^\d]{0,40}(\d+\.\d+)\s+[^\d]{0,25}(\d+\.\d+)",
+        block,
+    )
+    if lay_line_fb:
+        try:
+            a, b = lay_line_fb.group(1), lay_line_fb.group(2)
+            fa, fb = float(a), float(b)
+            if 1.01 <= fa <= 50 and 1.01 <= fb <= 50:
+                return a, b
+        except ValueError:
+            pass
     lay_m = re.search(r"(?:^|\n)\s*Lay\s+([^\n]+)", tail, re.I | re.MULTILINE)
     if not lay_m:
         return None, None
@@ -158,6 +352,165 @@ def _parse_betfair_exchange_lay_odds(page_text: str) -> tuple[str | None, str | 
         except ValueError:
             pass
     return None, None
+
+
+async def _get_betting_exchanges_subtree_text(page) -> str:
+    """Smallest DOM subtree whose innerText contains Betting exchanges + Lay + decimals (avoids body order issues)."""
+    try:
+        return await page.evaluate(
+            """() => {
+            let best = '';
+            for (const el of document.querySelectorAll('*')) {
+                const t = el.innerText || '';
+                if (t.length < 60 || t.length > 14000) continue;
+                const low = t.toLowerCase();
+                if (!low.includes('betting') && !low.includes('betfair')) continue;
+                if (!/Lay/i.test(t)) continue;
+                if (!/Betfair|Exchange|Betting/i.test(t)) continue;
+                if (!/\\d+\\.\\d/.test(t) && !/\\d+\\s*\\/\\s*\\d+/.test(t)) continue;
+                if (!best || t.length < best.length) best = t;
+            }
+            return best;
+        }"""
+        ) or ""
+    except Exception:
+        return ""
+
+
+async def _try_betfair_lay_via_betfair_container(page) -> tuple[str | None, str | None]:
+    """Find Betfair in the DOM and parse Lay from a nearby container (layout may not flatten to one innerText line)."""
+    for label in ("Betfair Exchange", "Betting Exchanges", "Betfair"):
+        try:
+            loc = page.get_by_text(label, exact=False).first
+            await loc.scroll_into_view_if_needed(timeout=5000)
+            await asyncio.sleep(1)
+            blob = await loc.evaluate(
+                """el => {
+                let n = el;
+                for (let i = 0; i < 10 && n; i++) {
+                    const t = (n.innerText || '');
+                    if (t.length > 120 && t.length < 12000 && /Lay/i.test(t) &&
+                        (/\\d+\\.\\d/.test(t) || /\\d+\\s*\\/\\s*\\d+/.test(t)) && /Betfair|Exchange|Betting/i.test(t)) {
+                        return t;
+                    }
+                    n = n.parentElement;
+                }
+                return '';
+            }"""
+            )
+            if blob and len(blob) > 80:
+                lo, lu = _parse_betfair_exchange_lay_odds(blob)
+                if lo or lu:
+                    return lo, lu
+        except Exception:
+            continue
+    return None, None
+
+
+async def _extract_betfair_lay_from_tables(page) -> tuple[str | None, str | None]:
+    """Re-parse Lay from table innerText only — body flattening can break Lay/Over/Under order."""
+    try:
+        blob = await page.evaluate(
+            """() => {
+            const parts = [];
+            for (const tbl of document.querySelectorAll('table')) {
+                const t = tbl.innerText || '';
+                if (t.length < 80) continue;
+                if (!/Betfair|Betting\\s+Exchanges/i.test(t)) continue;
+                if (!/\\bLay\\b/i.test(t)) continue;
+                parts.push(t);
+            }
+            return parts.join('\\n\\n---\\n\\n');
+        }"""
+        )
+        if not (blob or "").strip():
+            return None, None
+        return _parse_betfair_exchange_lay_odds(blob)
+    except Exception:
+        return None, None
+
+
+async def _click_oddsportal_over_under_market_tab(page) -> bool:
+    """Activate the Over/Under market tab — not a handicap row like 'Over/Under +0.5'.
+
+    Using get_by_text('Over/Under', exact=False).first often matches '+0.5' rows first, so the real tab never clicks.
+    Deep-link hashes can open 1X2 while 1st Half is selected — caller should use #/over-under route first.
+    """
+    makers = [
+        lambda: page.get_by_role("tab", name=re.compile(r"^\s*Over\s*/\s*Under\s*$", re.I)).first,
+        lambda: page.get_by_role("tab", name=re.compile(r"Over\s*/\s*Under", re.I)).first,
+        lambda: page.locator('a[href*="#/over-under"]').first,
+        lambda: page.get_by_text("Over/Under", exact=True).first,
+    ]
+    for make in makers:
+        try:
+            loc = make()
+            await loc.scroll_into_view_if_needed(timeout=5000)
+            await asyncio.sleep(0.35)
+            await loc.click(timeout=5000)
+            await asyncio.sleep(2)
+            return True
+        except Exception:
+            continue
+    # DOM varies: market row is 1X2 | Over/Under | … — find short label, not handicap text
+    try:
+        clicked = await page.evaluate(
+            """() => {
+            const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+            const byHref = document.querySelector('a[href*="#/over-under"]');
+            if (byHref && byHref.getClientRects().length) { byHref.click(); return true; }
+            for (const el of document.querySelectorAll('[role="tab"], a, button')) {
+                const t = norm(el.innerText || el.textContent);
+                if (/^over\\s*\\/\\s*under$/i.test(t) && t.length < 22 && !/\\+\\s*\\d/.test(t)) {
+                    el.click();
+                    return true;
+                }
+            }
+            const tabs = [...document.querySelectorAll('[role="tab"]')];
+            const i1 = tabs.findIndex((el) => /^1X2$/i.test(norm(el.textContent)));
+            if (i1 >= 0 && tabs[i1 + 1]) {
+                const t = norm(tabs[i1 + 1].textContent);
+                if (/over/i.test(t) && /under/i.test(t) && t.length < 24) {
+                    tabs[i1 + 1].click();
+                    return true;
+                }
+            }
+            return false;
+        }"""
+        )
+        if clicked:
+            await asyncio.sleep(2)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+async def _wait_for_body_text(page, min_len: int = 1500, timeout_ms: int = 60_000) -> bool:
+    """Wait until OddsPortal SPA has rendered real text (avoids racing UI before odds exist)."""
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    while time.monotonic() < deadline:
+        try:
+            n = await page.evaluate(
+                "() => (document.body && document.body.innerText ? document.body.innerText.length : 0)"
+            )
+            if n >= min_len:
+                return True
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
+    return False
+
+
+def _uk_fractional_to_decimal(frac: str) -> float | None:
+    """Convert UK fractional odds (e.g. 5/6) to decimal for comparison with bookmaker columns."""
+    m = re.match(r"^\s*(\d+)\s*/\s*(\d+)\s*$", frac.strip())
+    if not m:
+        return None
+    a, b = float(m.group(1)), float(m.group(2))
+    if b <= 0:
+        return None
+    return 1.0 + a / b
 
 
 def _fill_scores_and_date_from_page_text(page_text: str, result: dict) -> None:
@@ -268,6 +621,13 @@ def _is_match_page_url(href: str) -> bool:
         low = path.lower()
         if "/outrights" in low or "/standings" in low or "/draw/" in low:
             return False
+        # Head-to-head match URLs: /football/h2h/team-a-id/team-b-id/
+        if len(segments) >= 4 and segments[1].lower() == "h2h":
+            ta = segments[-2].split("-")
+            tb = segments[-1].split("-")
+            if len(ta) >= 2 and len(tb) >= 2:
+                return True
+            return False
         last = segments[-1].lower()
         if last in ("results", "outrights", "standings", "fixtures", "draw"):
             return False
@@ -354,7 +714,7 @@ def _split_legacy_combined_slug(team_slug: str) -> tuple[str, str]:
 
 
 def teams_from_match_url(href: str) -> tuple[str, str]:
-    """Home/away display names from OddsPortal match URL (h2h or legacy league folder)."""
+    """Display names from URL. For /h2h/ URLs, segment order is NOT always home/away (often alphabetical)."""
     href = (href or "").strip().split("?")[0].split("#")[0]
     try:
         path = urlparse(href).path.strip("/")
@@ -364,6 +724,7 @@ def teams_from_match_url(href: str) -> tuple[str, str]:
         if parts[0].lower() not in ("football", "soccer"):
             return "?", "?"
         if len(parts) >= 4 and parts[1].lower() == "h2h":
+            # First slug / second slug — use only as fallback; prefer results row or match page.
             home = _slug_segment_to_team_name(parts[2])
             away = _slug_segment_to_team_name(parts[3])
             return _apply_team_display(home, away)
@@ -376,6 +737,73 @@ def teams_from_match_url(href: str) -> tuple[str, str]:
         return _split_legacy_combined_slug(team_slug)
     except Exception:
         return "?", "?"
+
+
+def _parse_home_away_from_results_row(a) -> tuple[str | None, str | None]:
+    """Infer home (left) vs away (right) from a results-table row — fixes /h2h/ URL slug order."""
+    try:
+        p = a.parent
+        for _ in range(15):
+            if p is None:
+                break
+            text = p.get_text(separator="\n", strip=True)
+            lines = [x.strip() for x in text.split("\n") if x.strip()]
+            for i, line in enumerate(lines):
+                if not re.match(r"^\d{1,2}\s*[-:]\s*\d{1,2}$", line):
+                    continue
+                if not _is_likely_score(line.replace(":", "-")):
+                    continue
+                if i < 1 or i + 1 >= len(lines):
+                    continue
+                hi = i - 1
+                if re.match(r"^\d{1,2}\s+[A-Za-z]{3}\s+20\d{2}", lines[hi]) and hi >= 1:
+                    hi = i - 2
+                if hi < 0:
+                    continue
+                h, aw = lines[hi], lines[i + 1]
+                if len(h) < 55 and len(aw) < 55 and re.search(r"[A-Za-z]", h) and re.search(r"[A-Za-z]", aw):
+                    if h.lower() in ("finished", "live", "postponed"):
+                        continue
+                    return _apply_team_display(h, aw)
+            p = getattr(p, "parent", None)
+    except Exception:
+        pass
+    return None, None
+
+
+def _parse_home_away_from_match_page(html: str, inner_text: str) -> tuple[str | None, str | None]:
+    """Home vs away from OddsPortal match page (title / embedded JSON). Authoritative vs URL order."""
+    h = html or ""
+    ht = inner_text or ""
+    for blob in (h,):
+        hm = re.search(r'"homeTeam"\s*:\s*\{[^}]*"name"\s*:\s*"([^"\\]+)"', blob, re.I)
+        aw = re.search(r'"awayTeam"\s*:\s*\{[^}]*"name"\s*:\s*"([^"\\]+)"', blob, re.I)
+        if hm and aw:
+            return _apply_team_display(hm.group(1).strip(), aw.group(1).strip())
+    tm = re.search(r"<title>([^<]{5,240})</title>", h, re.I)
+    if tm:
+        t = re.sub(r"\s+", " ", tm.group(1)).strip()
+        for sep in (" | OddsPortal", " | OddsPortal.com", " Odds | OddsPortal", " Betting Odds |", " Odds |"):
+            if sep in t:
+                t = t.split(sep)[0].strip()
+        for pat in (
+            r"^(.+?)\s+vs\.?\s+(.+?)$",
+            r"^(.+?)\s+v\s+(.+?)$",
+        ):
+            mm = re.match(pat, t, re.I)
+            if mm and 2 < len(mm.group(1)) < 55 and 2 < len(mm.group(2)) < 55:
+                return _apply_team_display(mm.group(1).strip(), mm.group(2).strip())
+    for line in ht.split("\n")[:120]:
+        line = line.strip()
+        if len(line) < 5 or len(line) > 90:
+            continue
+        lo = line.lower()
+        if "odds" in lo or "over/under" in lo or "final result" in lo or "1x2" in lo:
+            continue
+        mm = re.match(r"^(.+?)\s+vs\.?\s+(.+?)$", line, re.I)
+        if mm and len(mm.group(2)) < 60:
+            return _apply_team_display(mm.group(1).strip(), mm.group(2).strip())
+    return None, None
 
 
 async def _dismiss_blocking_modals(page) -> None:
@@ -527,14 +955,16 @@ def parse_results_page_html(html: str, base_url: str, league_name: str) -> list[
     soup = BeautifulSoup(html, "html.parser")
     matches = []
     seen_urls = set()
-    # Optional ?query breaks a strict $ anchor; IDs are usually 6–8 chars
+    # League-folder match URLs + h2h URLs (OddsPortal often uses /football/h2h/.../.../)
     match_link_re = re.compile(
-        r"/(?:football|soccer)/[^/]+/[^/]+/[a-z0-9]+(?:-[a-z0-9]+)+-[a-zA-Z0-9]{3,}/?"
+        r"/(?:football|soccer)/[^/]+/[^/]+/[a-z0-9]+(?:-[a-z0-9]+)+-[a-zA-Z0-9]{3,}/?",
+        re.I,
     )
+    h2h_link_re = re.compile(r"/(?:football|soccer)/h2h/[^/]+/[^/]+/?", re.I)
 
     for a in soup.find_all("a", href=True):
         href = (a.get("href") or "").strip().split("?")[0].split("#")[0]
-        if not href or not match_link_re.search(href):
+        if not href or not (match_link_re.search(href) or h2h_link_re.search(href)):
             continue
         if not href.startswith("http"):
             href = f"https://www.oddsportal.com{href}" if href.startswith("/") else href
@@ -545,6 +975,10 @@ def parse_results_page_html(html: str, base_url: str, league_name: str) -> list[
         seen_urls.add(href)
 
         home, away = teams_from_match_url(href)
+        if "/h2h/" in href.lower():
+            ha, aw = _parse_home_away_from_results_row(a)
+            if ha and aw:
+                home, away = ha, aw
 
         parent = a.parent
         date_val, score_ft, score_ht = "", "", ""
@@ -621,6 +1055,12 @@ def extract_matches_from_embedded_urls(html: str, league_url: str, league_name: 
             flags=re.I,
         ):
             raw_urls.add("https://www.oddsportal.com" + m.group(0).rstrip("/"))
+        for m in re.finditer(
+            r"/(?:football|soccer)/h2h/[^/\s\"']+?/[^/\s\"']+/?",
+            blob,
+            flags=re.I,
+        ):
+            raw_urls.add("https://www.oddsportal.com" + m.group(0).rstrip("/").rstrip("\\"))
     out: list[dict] = []
     seen: set[str] = set()
     for raw in raw_urls:
@@ -713,15 +1153,21 @@ async def collect_matches_from_dom(page, league_url: str, league_name: str) -> l
 
 
 async def collect_h2h_matches_ordered(page, league_url: str, league_name: str) -> list[dict]:
-    """H2h match links in stable document order (same as earlier scraper versions)."""
+    """H2h links in main results area only (excludes sidebar / related widgets that reorder or duplicate)."""
     raw = await page.evaluate(
         """() => {
-        const root = document.getElementById('app') || document.querySelector('main') || document.body;
+        const root = document.querySelector('main') || document.getElementById('app') || document.body;
         const out = [];
         const seen = new Set();
-        for (const a of root.querySelectorAll('a[href]')) {
-            const href = (a.getAttribute('href') || '').toLowerCase();
-            if (!href.includes('/h2h/')) continue;
+        const skip = (el) => {
+          if (!el) return true;
+          if (el.closest('aside')) return true;
+          const c = el.closest('[class]');
+          if (c && /sidebar|side-bar|widget|partner|banner|promo/i.test(c.className || '')) return true;
+          return false;
+        };
+        for (const a of root.querySelectorAll('a[href*="/h2h/"]')) {
+            if (skip(a)) continue;
             let full = a.href.split('?')[0].split('#')[0];
             if (!full.includes('oddsportal.com')) continue;
             if (seen.has(full)) continue;
@@ -759,16 +1205,44 @@ async def scrape_match(
     screenshot_path: Path | None = None,
 ) -> dict:
     """Load match page, extract date & Betfair odds via page scraping (no API)."""
-    result = {
+    result: dict = {
         "date": "", "score_ft": "", "score_ht": "",
         "over_odds": None, "under_odds": None,
         "betfair_lay_over": None, "betfair_lay_under": None,
+        "home_team": None,
+        "away_team": None,
     }
+
+    url = _normalize_oddsportal_netloc(url)
+    base = url.split("#")[0].split("?")[0].rstrip("/")
+    ou_url = f"{base}#/over-under"
+
+    # Phase 1: open full match page first — date + "Final result" often missing on #/over-under only.
+    try:
+        await page.goto(base, wait_until="domcontentloaded", timeout=60_000)
+        await asyncio.sleep(8)
+        pt0 = await page.evaluate("() => document.body.innerText")
+        _fill_scores_and_date_from_page_text(pt0 or "", result)
+        html0 = await page.content()
+        _fill_scores_and_date_from_html(html0, result)
+        if not (result.get("date") or "").strip():
+            from bs4 import BeautifulSoup
+
+            _fill_scores_and_date_from_page_text(
+                BeautifulSoup(html0, "html.parser").get_text("\n"),
+                result,
+            )
+        hh, aa = _parse_home_away_from_match_page(html0, pt0 or "")
+        if hh and aa:
+            result["home_team"] = hh
+            result["away_team"] = aa
+    except Exception as ex:
+        print(f"    Note: could not preload match header ({ex})", flush=True)
 
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            await page.goto(url + "#/over-under", wait_until="domcontentloaded", timeout=60_000)
+            await page.goto(ou_url, wait_until="domcontentloaded", timeout=60_000)
             # SPAs often never reach "networkidle"; a fixed delay is more reliable than waiting on it.
             await asyncio.sleep(10)
             break
@@ -780,9 +1254,22 @@ async def scrape_match(
             else:
                 raise
 
-    line_str = str(line).replace(".", "\\.")  # for regex
+    if not await _wait_for_body_text(page, min_len=1500, timeout_ms=60_000):
+        print(
+            "    Warning: O/U page still has very little text — bot block, CAPTCHA, login, or slow SPA.",
+            flush=True,
+        )
+
+    bf_subtree = ""
     try:
-        # Over/Under hash already loaded above; give the tab a moment to paint.
+        # Cookie banner often covers the odds-format control; dismiss before anything else.
+        try:
+            await page.click("#onetrust-accept-btn-handler", timeout=4000)
+            await asyncio.sleep(1)
+        except Exception:
+            pass
+        await asyncio.sleep(2)
+        # Over/Under tab loaded above; give the UI a moment to paint.
         await asyncio.sleep(3)
         # Switch to Decimal odds (page defaults to Fractional - Betfair/bookmakers need Decimal view)
         try:
@@ -799,14 +1286,15 @@ async def scrape_match(
                     break
                 except Exception:
                     pass
-        for tab_name in ["Over/Under", "Goals"]:
-            try:
-                tab = page.get_by_text(tab_name, exact=False).first
-                await tab.click(timeout=3000)
-                await asyncio.sleep(2)
-                break
-            except Exception:
-                pass
+        if not await _click_oddsportal_over_under_market_tab(page):
+            for tab_name in ["Goals"]:
+                try:
+                    tab = page.get_by_text(tab_name, exact=False).first
+                    await tab.click(timeout=3000)
+                    await asyncio.sleep(2)
+                    break
+                except Exception:
+                    pass
         # Only click Full Time or 1st Half (per user selection - faster)
         # OddsPortal uses "1st Half" for half-time Over/Under; must load before extracting
         if market == "ft":
@@ -833,14 +1321,13 @@ async def scrape_match(
                     await asyncio.sleep(2)
                 except Exception:
                     pass
-        # Accept cookies if shown (may block content)
-        try:
-            await page.click("#onetrust-accept-btn-handler", timeout=2000)
-            await asyncio.sleep(1)
-        except Exception:
-            pass
         # Click the selected line row (+0.5, +1.5, or +2.5) - may expand to show Betfair
-        for label in [f'Over/Under +{line}', f'+{line}']:
+        for label in [
+            f"Over/Under +{line}",
+            f"Over/Under +{line} Goals",
+            f"+{line}",
+            f"+{line} Goals",
+        ]:
             try:
                 el = page.get_by_text(label, exact=False).first
                 await el.scroll_into_view_if_needed(timeout=3000)
@@ -849,7 +1336,7 @@ async def scrape_match(
                 break
             except Exception:
                 pass
-        # Scroll to load Betfair Exchange (at bottom, lazy-loaded). Scroll to section first.
+        # Scroll to load Betfair Exchange (at bottom, lazy-loaded). Do NOT click the heading — it can toggle/collapse the block.
         try:
             await page.get_by_text("Betting Exchanges", exact=False).first.scroll_into_view_if_needed(timeout=5000)
             await asyncio.sleep(3)
@@ -866,13 +1353,18 @@ async def scrape_match(
             pass
         await asyncio.sleep(2)
 
+        bf_subtree = ""
+        try:
+            bf_subtree = await _get_betting_exchanges_subtree_text(page)
+        except Exception as ex:
+            print(f"    Betfair subtree scan failed: {ex}", flush=True)
+
         # Extract via JS: date, scores, odds for selected line (pure page scraping)
         # For 1st Half (ht), must search within "1st Half" section to avoid Full Time odds
-        line_label = f"Over/Under +{line}"
         line_val = float(line)
         try:
             extracted = await page.evaluate("""(params) => {
-            const [lineLabel, isHalfTime, lineVal] = params;
+            const [lineLabels, isHalfTime, lineVal] = params;
             const text = document.body.innerText;
             const out = { date: '', scoreFt: '', scoreHt: '', underOdds: null, betfairLayUnder: null, betfairLayOver: null, overOdds: null };
             const dateMatch = text.match(/(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)?,?\\s*([\\d]{1,2}\\s+[A-Za-z]{3}\\s+[\\d]{4}(?:,\\s*[\\d]{1,2}:[\\d]{2})?)/);
@@ -895,6 +1387,13 @@ async def scrape_match(
                 }
             }
             const excludeLine = (v) => Math.abs(v - lineVal) > 0.15;
+            const fracToDec = (s) => {
+                const m = String(s).match(/(\\d+)\\s*\\/\\s*(\\d+)/);
+                if (!m) return null;
+                const a = parseFloat(m[1]), b = parseFloat(m[2]);
+                if (b <= 0) return null;
+                return 1 + a / b;
+            };
             const ouIdx = text.indexOf('Over/Under');
             let searchStart = 0;
             if (isHalfTime) {
@@ -906,16 +1405,28 @@ async def scrape_match(
                 const ftIdx = text.indexOf('Full Time', searchStart);
                 if (ftIdx >= 0) searchStart = ftIdx;
             }
-            let lineIdx = text.indexOf(lineLabel, searchStart);
+            let lineIdx = -1;
+            for (const lab of lineLabels) {
+                if (!lab) continue;
+                const j = text.indexOf(lab, searchStart);
+                if (j >= 0) { lineIdx = j; break; }
+            }
             if (lineIdx < 0 && !isHalfTime) {
                 const ftIdx = text.indexOf('Full Time');
-                if (ftIdx >= 0) lineIdx = text.indexOf(lineLabel, ftIdx);
+                if (ftIdx >= 0) {
+                    for (const lab of lineLabels) {
+                        if (!lab) continue;
+                        const j = text.indexOf(lab, ftIdx);
+                        if (j >= 0) { lineIdx = j; break; }
+                    }
+                }
             }
             if (lineIdx >= 0) {
                 const nextHandicap = text.indexOf('Over/Under +', lineIdx + 5);
                 const endIdx = nextHandicap >= 0 ? nextHandicap : lineIdx + 3500;
                 const chunk = text.substring(lineIdx, endIdx);
-                const nums = (chunk.match(/\\d+\\.\\d+/g) || []).map(parseFloat);
+                const raw = chunk.match(/\\d+[.,]\\d+/g) || [];
+                const nums = raw.map(x => parseFloat(String(x).replace(',', '.')));
                 const valid = nums.filter(v => v >= 1.01 && v <= 15 && excludeLine(v));
                 // Do not infer Betfair Lay from min/max here — Back + Lay rows mix; '-' has no price.
                 // Bookmaker Over/Under (not Lay)
@@ -926,13 +1437,36 @@ async def scrape_match(
                 } else if (!out.overOdds && !out.underOdds && valid.length === 1) {
                     out.underOdds = String(valid[0]);
                 }
+                if (!out.overOdds && !out.underOdds) {
+                    const fracs = chunk.match(/\\d{1,3}\\s*\\/\\s*\\d{1,3}/g) || [];
+                    const fracDecs = [];
+                    for (const f of fracs) {
+                        const v = fracToDec(f);
+                        if (v != null && v >= 1.01 && v <= 15 && excludeLine(v)) fracDecs.push(v);
+                    }
+                    if (fracDecs.length >= 2) {
+                        const sorted = [...fracDecs].sort((a,b)=>a-b);
+                        out.overOdds = String(sorted[0]);
+                        out.underOdds = String(sorted[1]);
+                    } else if (fracDecs.length === 1) {
+                        out.underOdds = String(fracDecs[0]);
+                    }
+                }
             }
             // Betfair Lay parsed in Python from Lay row only (not this text slice).
             // Broader fallback: any odds in line section when we still have nothing
             if (!out.overOdds && !out.underOdds && lineIdx >= 0) {
                 const chunk = text.substring(lineIdx, lineIdx + 4000);
-                const allNums = (chunk.match(/\\d+\\.\\d+/g) || []).map(parseFloat);
-                const allValid = allNums.filter(v => v >= 1.01 && v <= 15 && excludeLine(v));
+                const raw2 = chunk.match(/\\d+[.,]\\d+/g) || [];
+                const allNums = raw2.map(x => parseFloat(String(x).replace(',', '.')));
+                let allValid = allNums.filter(v => v >= 1.01 && v <= 15 && excludeLine(v));
+                if (allValid.length < 2) {
+                    const fr2 = chunk.match(/\\d{1,3}\\s*\\/\\s*\\d{1,3}/g) || [];
+                    for (const f of fr2) {
+                        const v = fracToDec(f);
+                        if (v != null && v >= 1.01 && v <= 15 && excludeLine(v)) allValid.push(v);
+                    }
+                }
                 if (allValid.length >= 2) {
                     const s = [...allValid].sort((a,b)=>a-b);
                     out.overOdds = String(s[0]);
@@ -942,7 +1476,18 @@ async def scrape_match(
                 }
             }
             return out;
-        }""", [line_label, market == "ht", line_val])
+        }""",
+            [
+                [
+                    f"Over/Under +{line}",
+                    f"Over/Under +{line} Goals",
+                    f"+{line}",
+                    f"+{line} Goals",
+                ],
+                market == "ht",
+                line_val,
+            ],
+        )
         except Exception as ex:
             extracted = None
             print(f"    Extract warning: {ex}", flush=True)
@@ -981,11 +1526,86 @@ async def scrape_match(
                     flush=True,
                 )
             _fill_scores_and_date_from_page_text(page_text or "", result)
-            lo, lu = _parse_betfair_exchange_lay_odds(page_text or "")
+            combined_ou = "\n\n".join(
+                x for x in (bf_subtree, page_text or "") if (x or "").strip()
+            )
+            lo, lu = _parse_betfair_exchange_lay_odds(combined_ou or page_text or "")
             result["betfair_lay_over"] = lo
             result["betfair_lay_under"] = lu
-        except Exception:
-            pass
+            if not lo and not lu:
+                from bs4 import BeautifulSoup
+
+                lo2, lu2 = _parse_betfair_exchange_lay_odds(
+                    BeautifulSoup((await page.content()) or "", "html.parser").get_text("\n")
+                )
+                if lo2:
+                    result["betfair_lay_over"] = lo2
+                if lu2:
+                    result["betfair_lay_under"] = lu2
+            if not result.get("betfair_lay_over") and not result.get("betfair_lay_under"):
+                try:
+                    bet = await page.evaluate(
+                        """() => {
+                        const t = document.body && document.body.innerText ? document.body.innerText : '';
+                        const lower = t.toLowerCase();
+                        let i = lower.indexOf('betfair exchange');
+                        if (i < 0) i = lower.indexOf('betting exchanges');
+                        if (i < 0) i = lower.indexOf('betfair');
+                        if (i < 0) return null;
+                        const slice = t.slice(i, i + 80000);
+                        const re1 = /Lay[\\s\\S]{0,12000}?Over\\s+(\\S+)\\s+Under\\s+(\\S+)/gi;
+                        let m, last = null;
+                        while ((m = re1.exec(slice)) !== null) last = m;
+                        if (!last) {
+                            const re2 = /Lay\\s+Over\\s+(\\S+)\\s+Under\\s+(\\S+)/gi;
+                            while ((m = re2.exec(slice)) !== null) last = m;
+                        }
+                        if (!last) return null;
+                        const stripVol = (s) => String(s).replace(/\\s*\\([^)]*\\)\\s*$/g, '').trim().replace(',', '.');
+                        const oRaw = stripVol(last[1]);
+                        const uRaw = stripVol(last[2]);
+                        const u = parseFloat(uRaw);
+                        if (isNaN(u) || u < 1.01 || u > 50) return null;
+                        if (!oRaw || /^[-–−—\\u2010-\\u2015]+$/.test(oRaw) || oRaw === '-') {
+                            return { o: null, u: uRaw };
+                        }
+                        const o = parseFloat(oRaw);
+                        if (isNaN(o) || o < 1.01 || o > 50) return null;
+                        return { o: oRaw, u: uRaw };
+                    }"""
+                    )
+                    if bet and isinstance(bet, dict):
+                        if bet.get("o"):
+                            result["betfair_lay_over"] = str(bet["o"])
+                        if bet.get("u"):
+                            result["betfair_lay_under"] = str(bet["u"])
+                except Exception as ex:
+                    print(f"    Betfair inline JS eval failed: {ex}", flush=True)
+            if not result.get("betfair_lay_over") and not result.get("betfair_lay_under"):
+                lo_tb, lu_tb = await _extract_betfair_lay_from_tables(page)
+                if lo_tb:
+                    result["betfair_lay_over"] = lo_tb
+                if lu_tb:
+                    result["betfair_lay_under"] = lu_tb
+            if not result.get("betfair_lay_over") and not result.get("betfair_lay_under"):
+                lo3, lu3 = await _try_betfair_lay_via_betfair_container(page)
+                if lo3:
+                    result["betfair_lay_over"] = lo3
+                if lu3:
+                    result["betfair_lay_under"] = lu3
+            if (
+                not result.get("betfair_lay_over")
+                and not result.get("betfair_lay_under")
+                and (page_text or "").strip()
+                and "betfair" in (page_text or "").lower()
+                and "lay" in (page_text or "").lower()
+            ):
+                print(
+                    "    Note: page text mentions Betfair and Lay but Lay Over/Under was not parsed.",
+                    flush=True,
+                )
+        except Exception as ex:
+            print(f"    Match odds/Betfair block failed: {ex}", flush=True)
 
         # 3. Fallback: bookmaker Over/Under from HTML when still empty
         if not result.get("over_odds") or not result.get("under_odds"):
@@ -995,11 +1615,25 @@ async def scrape_match(
             page_text = soup.get_text()
             idx = page_text.find(f"Over/Under +{line}")
             if idx < 0:
+                idx = page_text.find(f"Over/Under +{line} Goals")
+            if idx < 0:
                 idx = page_text.find(f"+{line}")
             if idx >= 0:
                 chunk = page_text[idx : idx + 3000]
-                nums = re.findall(r"\d+\.\d+", chunk)
-                valid = [n for n in nums if 1.01 <= float(n) <= 15 and abs(float(n) - line) > 0.15]
+                nums_raw = re.findall(r"\d+[.,]\d+", chunk)
+                valid = []
+                for n in nums_raw:
+                    try:
+                        v = float(n.replace(",", "."))
+                        if 1.01 <= v <= 15 and abs(v - line) > 0.15:
+                            valid.append(str(v))
+                    except ValueError:
+                        pass
+                if len(valid) < 2:
+                    for fm in re.findall(r"\d{1,3}\s*/\s*\d{1,3}", chunk):
+                        v = _uk_fractional_to_decimal(fm.replace(" ", ""))
+                        if v is not None and 1.01 <= v <= 15 and abs(v - line) > 0.15:
+                            valid.append(str(round(v, 4)))
                 if len(valid) >= 2:
                     sorted_valid = sorted(valid, key=lambda x: float(x))
                     if not result.get("over_odds"):
@@ -1043,6 +1677,54 @@ async def scrape_match(
                 await page.screenshot(path=str(screenshot_path))
             except Exception:
                 pass
+
+        if not result.get("home_team") or not result.get("away_team"):
+            html_end = await page.content()
+            pt_end = await page.evaluate("() => document.body.innerText")
+            hh, aa = _parse_home_away_from_match_page(html_end, pt_end or "")
+            if hh and aa:
+                result["home_team"] = hh
+                result["away_team"] = aa
+
+        if not result.get("betfair_lay_over") and not result.get("betfair_lay_under"):
+            try:
+                lo3, lu3 = await _extract_betfair_lay_from_tables(page)
+                if lo3:
+                    result["betfair_lay_over"] = lo3
+                if lu3:
+                    result["betfair_lay_under"] = lu3
+                if not result.get("betfair_lay_over") and not result.get("betfair_lay_under"):
+                    lo3c, lu3c = await _try_betfair_lay_via_betfair_container(page)
+                    if lo3c:
+                        result["betfair_lay_over"] = lo3c
+                    if lu3c:
+                        result["betfair_lay_under"] = lu3c
+            except Exception as ex:
+                print(f"    Betfair late fallback failed: {ex}", flush=True)
+            try:
+                for _ in range(5):
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    await asyncio.sleep(2)
+                page_text_full = await page.evaluate("() => document.body.innerText")
+                lo, lu = _parse_betfair_exchange_lay_odds(page_text_full or "")
+                if lo:
+                    result["betfair_lay_over"] = lo
+                if lu:
+                    result["betfair_lay_under"] = lu
+                if not result.get("betfair_lay_over") and not result.get("betfair_lay_under"):
+                    lo_tb2, lu_tb2 = await _extract_betfair_lay_from_tables(page)
+                    if lo_tb2:
+                        result["betfair_lay_over"] = lo_tb2
+                    if lu_tb2:
+                        result["betfair_lay_under"] = lu_tb2
+                if not result.get("betfair_lay_over") and not result.get("betfair_lay_under"):
+                    lo4, lu4 = await _try_betfair_lay_via_betfair_container(page)
+                    if lo4:
+                        result["betfair_lay_over"] = lo4
+                    if lu4:
+                        result["betfair_lay_under"] = lu4
+            except Exception as ex:
+                print(f"    Betfair scroll/reparse failed: {ex}", flush=True)
 
     except PlaywrightTimeout:
         pass
@@ -1114,7 +1796,7 @@ def _match_url_belongs_to_league(match_url: str, league_url: str) -> bool:
 
 
 def _load_existing_results(out_dir: Path, slug: str, league_url: str = "") -> tuple[list[MatchData], set[str]]:
-    """Load existing CSV for league. Only loads rows whose match_url is for this league."""
+    """Load existing CSV. Second value is URLs treated as *complete* (skipped on resume). Incomplete rows are re-scraped."""
     csv_path = out_dir / f"{slug}.csv"
     if not csv_path.exists():
         return [], set()
@@ -1123,6 +1805,7 @@ def _load_existing_results(out_dir: Path, slug: str, league_url: str = "") -> tu
         df = pd.read_csv(csv_path)
         results = []
         seen = set()
+        complete_urls: set[str] = set()
         def _opt(row, col, default=""):
             if col not in df.columns:
                 return default
@@ -1148,7 +1831,7 @@ def _load_existing_results(out_dir: Path, slug: str, league_url: str = "") -> tu
             htt = _opt(row, "half_time_total", "") or _opt(row, "half_time_total_goals", "")
             if not htt:
                 htt = _half_time_total_goals(hth, hta)
-            results.append(MatchData(
+            md = MatchData(
                 date=_opt(row, "date", ""),
                 home_team=_opt(row, "home_team", ""),
                 away_team=_opt(row, "away_team", ""),
@@ -1163,8 +1846,11 @@ def _load_existing_results(out_dir: Path, slug: str, league_url: str = "") -> tu
                 betfair_lay_under=bfu or None,
                 match_url=url,
                 league=_opt(row, "league", ""),
-            ))
-        return results, seen
+            )
+            results.append(md)
+            if not _match_row_incomplete(md):
+                complete_urls.add(url)
+        return results, complete_urls
     except Exception as e:
         print(f"  Could not load existing CSV: {e}")
         return [], set()
@@ -1383,7 +2069,13 @@ async def main(run_config: ScraperConfig | None = None, progress_cb=None):
                 league_results, existing_urls = _load_existing_results(out_dir, slug, league_url)
                 print(f"\n--- League: {league_name} ---", flush=True)
                 if league_results:
-                    print(f"  Resuming: {len(league_results)} matches already scraped.", flush=True)
+                    n_inc = sum(1 for r in league_results if _match_row_incomplete(r))
+                    n_ok = len(league_results) - n_inc
+                    print(
+                        f"  Resuming: {len(league_results)} rows in CSV ({n_ok} complete, {n_inc} incomplete). "
+                        f"{'Re-fetching incomplete rows.' if n_inc else ''}",
+                        flush=True,
+                    )
 
             max_pages = getattr(config, "MAX_PAGINATION_PAGES", 20)
             target_matches = run_config.match_limit if run_config else getattr(config, "TARGET_MATCHES_PER_SEASON", 380)
@@ -1714,7 +2406,8 @@ async def main(run_config: ScraperConfig | None = None, progress_cb=None):
                 limit_run = config.MAX_MATCHES_PER_RUN
                 take = len(to_scrape)
                 if target_matches:
-                    take = min(take, max(0, target_matches - len(league_results)))
+                    complete_n = sum(1 for r in league_results if not _match_row_incomplete(r))
+                    take = min(take, max(0, target_matches - complete_n))
                 if limit_run:
                     take = min(take, max(0, limit_run - total_new_this_run))
                 to_process = to_scrape[:take] if take > 0 else []
@@ -1779,10 +2472,18 @@ async def main(run_config: ScraperConfig | None = None, progress_cb=None):
                     ht_home, ht_away = _parse_score(score_ht)
 
                     fix_home, fix_away = teams_from_match_url(m.get("match_url", ""))
-                    home_team = fix_home if fix_home != "?" else m.get("home_team", "")
-                    away_team = fix_away if fix_away != "?" else m.get("away_team", "")
+                    home_team = (
+                        api_result.get("home_team")
+                        or m.get("home_team")
+                        or (fix_home if fix_home != "?" else "")
+                    )
+                    away_team = (
+                        api_result.get("away_team")
+                        or m.get("away_team")
+                        or (fix_away if fix_away != "?" else "")
+                    )
 
-                    league_results.append(MatchData(
+                    new_row = MatchData(
                         date=date_val,
                         home_team=home_team,
                         away_team=away_team,
@@ -1797,8 +2498,18 @@ async def main(run_config: ScraperConfig | None = None, progress_cb=None):
                         betfair_lay_under=api_result.get("betfair_lay_under"),
                         match_url=m.get("match_url", ""),
                         league=m.get("league", ""),
-                    ))
-                    existing_urls.add(m.get("match_url", ""))
+                    )
+                    mu = m.get("match_url", "")
+                    replaced = False
+                    for j, row in enumerate(league_results):
+                        if row.match_url == mu:
+                            league_results[j] = new_row
+                            replaced = True
+                            break
+                    if not replaced:
+                        league_results.append(new_row)
+                    if not _match_row_incomplete(new_row):
+                        existing_urls.add(mu)
                     total_new_this_run += 1
                     # Progress report: percent and ETA
                     done = len(league_results)
