@@ -97,7 +97,8 @@ Parsing _ Project/
 
 - **Leagues**: add URLs to `LEAGUES` in `config.py` — one CSV per league/season
 - **Output folder**: set `OUTPUT_DIR` in `config.py` (default: `output/`)
-- **Max matches**: set `MAX_MATCHES_PER_RUN` (`None` = no limit)
+- **Max matches per run**: `MAX_MATCHES_PER_RUN` in `config.py` (`None` = no cap)
+- **Total rows cap** (optional): `TARGET_MATCHES_PER_SEASON` (`None` = no cap; scrape full league). The GUI can set a temporary “Limit to N matches” for testing.
 
 ---
 

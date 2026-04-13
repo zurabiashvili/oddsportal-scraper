@@ -29,9 +29,11 @@ DELAY_BETWEEN_REQUESTS = 1   # Be respectful, avoid rate limits (reduced for spe
 HEADLESS = False             # True often gets 0 matches on OddsPortal; use False to see browser + CAPTCHA
 # Saved after login — next runs can reuse cookies (still set HEADLESS=False if blocked)
 AUTH_STATE_FILE = "output/.auth/oddsportal_state.json"
-MAX_MATCHES_PER_RUN = None   # None = no limit; scraper runs until TARGET_MATCHES_PER_SEASON (380). Do not set to 50.
+MAX_MATCHES_PER_RUN = None   # None = no per-run cap (aside from TARGET_MATCHES_PER_SEASON if set)
 MAX_PAGINATION_PAGES = 20    # Max results pages to try (page 2, 3, ... for older matches)
-TARGET_MATCHES_PER_SEASON = 380  # Stop when we have this many (full PL season)
+# None = no total row cap — scrape until all pages are exhausted (league size varies: ~300–400+).
+# Set an int only if you need a hard stop (e.g. testing). GUI "Limit to N" overrides when set.
+TARGET_MATCHES_PER_SEASON = None
 
 # Output - one CSV per league/season in output_dir
 OUTPUT_DIR = "output"

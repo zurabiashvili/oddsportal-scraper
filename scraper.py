@@ -2606,7 +2606,7 @@ async def main(run_config: ScraperConfig | None = None, progress_cb=None):
                     )
 
             max_pages = getattr(config, "MAX_PAGINATION_PAGES", 20)
-            target_matches = run_config.match_limit if run_config else getattr(config, "TARGET_MATCHES_PER_SEASON", 380)
+            target_matches = run_config.match_limit if run_config else getattr(config, "TARGET_MATCHES_PER_SEASON", None)
             oldest_first = (run_config.direction == "oldest") if run_config else False
             market = run_config.market if run_config else "ft"
             line = float(run_config.line) if run_config else 1.5
