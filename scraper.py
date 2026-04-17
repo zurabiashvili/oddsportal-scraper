@@ -10,7 +10,9 @@ Uses page scraping (JS + HTML parsing) to extract scores and Betfair Lay odds.
 
 import asyncio
 import csv
+import os
 import re
+import shutil
 import time
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -69,12 +71,11 @@ def _match_row_incomplete(md: MatchData) -> bool:
         return not s or s.lower() == "nan"
 
     no_date = not (md.date or "").strip()
-    no_ft = not (md.full_time_home or "").strip()
+    no_ft = not (md.full_time_home or "").strip() or not (md.full_time_away or "").strip()
     if no_date and no_ft:
         return True
-    has_ft = bool((md.full_time_home or "").strip())
-    if not has_ft:
-        return False
+    if no_ft:
+        return True
     return (
         _empty(md.over_odds)
         and _empty(md.under_odds)
@@ -83,7 +84,34 @@ def _match_row_incomplete(md: MatchData) -> bool:
     )
 
 
-def _parse_match_datetime(s: str) -> datetime | None:
+def _season_years_from_league_url(league_url: str) -> tuple[int, int] | None:
+    """(start_year, end_year) from .../league-one-2024-2025/... in the results URL."""
+    if not league_url:
+        return None
+    m = re.search(r"(20\d{2})-(20\d{2})", league_url)
+    if not m:
+        return None
+    y1, y2 = int(m.group(1)), int(m.group(2))
+    if y2 != y1 + 1:
+        return None
+    return y1, y2
+
+
+def _infer_year_weekday_bar(dpart: str, league_url: str) -> int:
+    """Calendar year for '11 Apr' when grey-bar headers omit the year (avoid always using today().year)."""
+    try:
+        month = datetime.strptime(dpart.strip(), "%d %b").month
+    except ValueError:
+        return date.today().year
+    span = _season_years_from_league_url(league_url)
+    if span:
+        y1, y2 = span
+        # European season: Aug–Dec → first year; Jan–Jul → second year
+        return y1 if month >= 8 else y2
+    return date.today().year
+
+
+def _parse_match_datetime(s: str, league_url: str = "") -> datetime | None:
     """Parse OddsPortal date strings (incl. 'Today, 11 Apr', 'Yesterday, 10 Apr', weekday headers) for sort/export."""
     if not s:
         return None
@@ -98,7 +126,7 @@ def _parse_match_datetime(s: str) -> datetime | None:
     )
     if m:
         dpart, year_s, tim = m.group(1), m.group(2), m.group(3)
-        year = int(year_s) if year_s else date.today().year
+        year = int(year_s) if year_s else _infer_year_weekday_bar(dpart, league_url)
         try:
             if tim:
                 return datetime.strptime(f"{dpart} {year} {tim}", "%d %b %Y %H:%M")
@@ -119,11 +147,11 @@ def _parse_match_datetime(s: str) -> datetime | None:
     return None
 
 
-def normalize_match_date_field(raw: str) -> str:
+def normalize_match_date_field(raw: str, league_url: str = "") -> str:
     """Export one consistent format: 'dd Mon YYYY' or 'dd Mon YYYY, HH:MM'. Collapses stray newlines."""
     if not raw:
         return ""
-    dt = _parse_match_datetime(raw)
+    dt = _parse_match_datetime(raw, league_url)
     if not dt:
         return re.sub(r"\s+", " ", str(raw).strip().replace("\n", " "))
     if dt.hour or dt.minute:
@@ -146,8 +174,77 @@ def _sort_results_chronological(results: list) -> None:
     _sort_results_for_export(results, oldest_first=True)
 
 
-# CSV/XLSX template: row 1 headers; G2 = % of matches with ≥1 HT goal; A3 = match count; rows 4–10 blank; data from row 11.
+# CSV/XLSX template: G2 fraction; P2 EDGE; N3 avg odds; N4/Q4; match rows from config.MATCH_DATA_START_ROW (default 10).
 EXPORT_TEMPLATE_G_HEADER = "AVG % of matches with at least one goal"
+EXPORT_TEMPLATE_N_AVG_BETFAIR_LAY_ODDS_LABEL = "AVERAGE ODDS"
+# N4: implied % from average lay odds (lay break-even framing): 100-(100/N3). Example: N3=3.346 → ~70.11%.
+EXPORT_TEMPLATE_N_IMPLIED_PCT_FORMULA = '=IFERROR(100-(100/N3),"")'
+# P2: EDGE vs average odds; G2 must be a fraction (0.6 = 60%) so 100% is the number 1 in Excel.
+EXPORT_TEMPLATE_P_EDGE_FORMULA = "=G2-(100%-(1/N3))"
+# Q4: EV (percentage points) = real% minus N4; G2 is fraction so use G2*100.
+EXPORT_TEMPLATE_Q_EV_FORMULA = '=IFERROR(G2*100-N4,"")'
+
+
+def _template_match_data_start_row() -> int:
+    """First Excel row for match rows (1-based). Must be ≥2."""
+    return max(2, int(getattr(config, "MATCH_DATA_START_ROW", 10)))
+
+
+def _template_n_avg_odds_formula() -> str:
+    """Average Betfair lay-under column; range starts at MATCH_DATA_START_ROW."""
+    r0 = _template_match_data_start_row()
+    return (
+        f'=IFERROR(SUMPRODUCT((N{r0}:N10000<>"")*(N{r0}:N10000*1))/'
+        f'SUMPRODUCT((N{r0}:N10000<>"")*1),"")'
+    )
+
+
+_excel_template_missing_log: str | None = None
+
+
+def _excel_template_path_candidates() -> list[Path]:
+    """Ordered search locations for the Excel template (first match wins)."""
+    name = str(getattr(config, "EXCEL_TEMPLATE_FILE", "Template_Frame.xlsx"))
+    out = Path(str(getattr(config, "OUTPUT_DIR", "output")))
+    base = Path(__file__).resolve().parent
+    raw: list[Path] = []
+    env = (os.environ.get("ODDSPORTAL_EXCEL_TEMPLATE") or "").strip()
+    if env:
+        raw.append(Path(env))
+    abs_cfg = str(getattr(config, "EXCEL_TEMPLATE_ABSOLUTE", "") or "").strip()
+    if abs_cfg:
+        raw.append(Path(abs_cfg))
+    # Repo-committed default (not under gitignored output/)
+    raw.append(base / "templates" / name)
+    if out.is_absolute():
+        raw.append(out / name)
+    else:
+        raw.append(base / out / name)
+        raw.append(Path.cwd() / out / name)
+    seen: set[str] = set()
+    uniq: list[Path] = []
+    for p in raw:
+        key = str(p)
+        if key not in seen:
+            seen.add(key)
+            uniq.append(p)
+    return uniq
+
+
+def _resolve_excel_template() -> Path | None:
+    for p in _excel_template_path_candidates():
+        try:
+            if p.is_file():
+                return p
+        except OSError:
+            continue
+    return None
+
+
+def _excel_template_path() -> Path:
+    """Primary expected template path (for docs); use _resolve_excel_template() to load."""
+    c = _excel_template_path_candidates()
+    return c[0] if c else Path(__file__).resolve().parent / "output" / "Template_Frame.xlsx"
 
 
 def _export_template_headers() -> list[str]:
@@ -167,6 +264,8 @@ def _export_template_headers() -> list[str]:
         "betfair_lay_over",
         "betfair_lay_under",
         "league",
+        "EDGE",
+        "EV",
     ]
 
 
@@ -188,14 +287,15 @@ def _match_ht_total_int(md: MatchData) -> int | None:
     return None
 
 
-def _pct_matches_ht_at_least_one(matches: list[MatchData]) -> str:
+def _pct_matches_ht_fraction(matches: list[MatchData]) -> float:
+    """Share of matches with ≥1 HT goal (0.0–1.0). Used as Excel numeric G2 with % format."""
     n = len(matches)
     if n == 0:
-        return "0.0%"
+        return 0.0
     with_goal = sum(
         1 for m in matches if (t := _match_ht_total_int(m)) is not None and t >= 1
     )
-    return f"{100.0 * with_goal / n:.1f}%"
+    return with_goal / n
 
 
 def _date_to_dd_mm_yyyy(raw: str) -> str:
@@ -233,59 +333,177 @@ def _match_data_to_template_row(md: MatchData) -> list[str]:
         md.betfair_lay_over or "",
         md.betfair_lay_under or "",
         md.league,
+        "",
+        "",
     ]
 
 
+def _xlsx_template_cell_value(column: int, val: str) -> object:
+    """Write numbers as numeric Excel types so AVERAGE/EV formulas work (strings are ignored by AVERAGE)."""
+    if val is None or (isinstance(val, str) and not str(val).strip()):
+        return None
+    s = str(val).strip()
+    # K–N (1-based 11–14): over_odds, under_odds, betfair_lay_over, betfair_lay_under
+    if column in (11, 12, 13, 14):
+        return _parse_template_odds_float(s)
+    # D–F, I–J: HT cells and full-time goals
+    if column in (4, 5, 6, 9, 10):
+        try:
+            return int(s)
+        except ValueError:
+            return s
+    return s
+
+
+def _csv_template_row(md: MatchData) -> list:
+    """CSV row with odds as floats so Excel (and AVERAGE on .xlsx) sees real numbers when opening the CSV."""
+    row = _match_data_to_template_row(md)
+    out: list = []
+    for i, val in enumerate(row):
+        if i in (10, 11, 12, 13):
+            v = _parse_template_odds_float(str(val) if val is not None else "")
+            out.append("" if v is None else v)
+        elif i in (3, 4, 5, 8, 9):
+            s = str(val).strip() if val is not None else ""
+            if not s:
+                out.append("")
+            else:
+                try:
+                    out.append(int(s))
+                except ValueError:
+                    out.append(s)
+        else:
+            out.append(val)
+    return out
+
+
 def _write_matches_template_csv(path: Path, league_results: list[MatchData]) -> None:
-    """Write CSV: summary in rows 1–3, blank rows 4–10, match rows from row 11 (columns H+ hold resume fields)."""
+    """Write CSV: summary rows 1–4; blanks until MATCH_DATA_START_ROW; match data from that row."""
     headers = _export_template_headers()
     ncol = len(headers)
-    pct = _pct_matches_ht_at_least_one(league_results)
     n = len(league_results)
     empty = [""] * ncol
     row2 = empty.copy()
-    row2[6] = pct
+    row2[6] = _pct_matches_ht_fraction(league_results)
+    row2[13] = EXPORT_TEMPLATE_N_AVG_BETFAIR_LAY_ODDS_LABEL
+    row2[15] = EXPORT_TEMPLATE_P_EDGE_FORMULA
     row3 = empty.copy()
     row3[0] = str(n)
+    row3[13] = _template_n_avg_odds_formula()
+    row4 = empty.copy()
+    row4[13] = EXPORT_TEMPLATE_N_IMPLIED_PCT_FORMULA
+    row4[16] = EXPORT_TEMPLATE_Q_EV_FORMULA
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(headers)
         w.writerow(row2)
         w.writerow(row3)
-        for _ in range(7):
+        w.writerow(row4)
+        for _ in range(max(0, _template_match_data_start_row() - 5)):
             w.writerow(empty)
         for md in league_results:
-            w.writerow(_match_data_to_template_row(md))
+            w.writerow(_csv_template_row(md))
 
 
 def _write_matches_template_xlsx(path: Path, league_results: list[MatchData]) -> None:
-    """Same layout as CSV for Excel."""
-    from openpyxl import Workbook
+    """Excel: copy resolved template if present (keep rows 1–4), else build sheet; data from MATCH_DATA_START_ROW."""
+    from openpyxl import Workbook, load_workbook
 
-    wb = Workbook()
-    ws = wb.active
-    headers = _export_template_headers()
-    for c, h in enumerate(headers, start=1):
-        ws.cell(row=1, column=c, value=h)
-    ws.cell(row=2, column=7, value=_pct_matches_ht_at_least_one(league_results))
-    ws.cell(row=3, column=1, value=len(league_results))
-    r = 11
+    global _excel_template_missing_log
+
+    data_start = _template_match_data_start_row()
+    tpl = _resolve_excel_template()
+    ncol = len(_export_template_headers())
+
+    if tpl is not None:
+        try:
+            shutil.copy2(tpl, path)
+            wb = load_workbook(path)
+            ws = wb.active
+        except Exception as e:
+            if _excel_template_missing_log != f"err:{e!s}":
+                print(
+                    f"  Excel: could not use template {tpl} ({e}) — built-in sheet.",
+                    flush=True,
+                )
+                _excel_template_missing_log = f"err:{e}"
+            tpl = None
+
+    if tpl is not None:
+        g2 = ws.cell(row=2, column=7, value=_pct_matches_ht_fraction(league_results))
+        g2.number_format = "0.00%"
+        ws.cell(row=3, column=1, value=len(league_results))
+        ws.cell(row=3, column=14, value=_template_n_avg_odds_formula())
+        for r in range(5, data_start):
+            for c in range(1, ncol + 1):
+                ws.cell(row=r, column=c).value = None
+        end_clear = max(ws.max_row, data_start + len(league_results) + 200)
+        for r in range(data_start, end_clear + 1):
+            for c in range(1, ncol + 1):
+                ws.cell(row=r, column=c).value = None
+    else:
+        if _excel_template_missing_log != "missing":
+            cands = ", ".join(str(p) for p in _excel_template_path_candidates())
+            print(
+                f"  Excel: no template file found (searched: {cands}). "
+                f"Add {getattr(config, 'EXCEL_TEMPLATE_FILE', 'Template_Frame.xlsx')} under templates/ or output/, "
+                f"or set EXCEL_TEMPLATE_ABSOLUTE / ODDSPORTAL_EXCEL_TEMPLATE.",
+                flush=True,
+            )
+            _excel_template_missing_log = "missing"
+        wb = Workbook()
+        ws = wb.active
+        headers = _export_template_headers()
+        for c, h in enumerate(headers, start=1):
+            ws.cell(row=1, column=c, value=h)
+        g2 = ws.cell(row=2, column=7, value=_pct_matches_ht_fraction(league_results))
+        g2.number_format = "0.00%"
+        ws.cell(row=2, column=14, value=EXPORT_TEMPLATE_N_AVG_BETFAIR_LAY_ODDS_LABEL)
+        p2 = ws.cell(row=2, column=16, value=EXPORT_TEMPLATE_P_EDGE_FORMULA)
+        p2.number_format = "0.0%"
+        ws.cell(row=3, column=1, value=len(league_results))
+        ws.cell(row=3, column=14, value=_template_n_avg_odds_formula())
+        ws.cell(row=4, column=14, value=EXPORT_TEMPLATE_N_IMPLIED_PCT_FORMULA)
+        ws.cell(row=4, column=17, value=EXPORT_TEMPLATE_Q_EV_FORMULA)
+
+    r = data_start
     for md in league_results:
         for c, val in enumerate(_match_data_to_template_row(md), start=1):
-            ws.cell(row=r, column=c, value=val if val != "" else None)
+            cell = ws.cell(row=r, column=c)
+            v = _xlsx_template_cell_value(c, val)
+            cell.value = v
+            if isinstance(v, float):
+                cell.number_format = "0.00"
+            elif isinstance(v, int) and not isinstance(v, bool):
+                cell.number_format = "0"
         r += 1
     wb.save(path)
 
 
 def _read_results_dataframe(csv_path: Path):
-    """Load dataframe from legacy flat CSV or new template CSV (summary rows + data from row 11)."""
+    """Load dataframe from template CSV (summary rows, then data from MATCH_DATA_START_ROW; legacy row 11 supported)."""
     import pandas as pd
 
     with open(csv_path, encoding="utf-8") as f:
         line1 = f.readline()
-    if "Home Team" in line1 and "Away Team" in line1:
-        return pd.read_csv(csv_path, header=0, skiprows=range(1, 10))
-    return pd.read_csv(csv_path, header=0)
+    if "Home Team" not in line1 or "Away Team" not in line1:
+        return pd.read_csv(csv_path, header=0)
+    start = _template_match_data_start_row()
+    candidates: list[int] = []
+    sk = start - 1
+    if sk >= 1:
+        candidates.append(sk)
+    if 10 >= 1 and 10 not in candidates:
+        candidates.append(10)
+    for skip_end in candidates:
+        df = pd.read_csv(csv_path, header=0, skiprows=range(1, skip_end))
+        if len(df) == 0:
+            continue
+        date_col = "Date" if "Date" in df.columns else df.columns[0]
+        d0 = str(df.iloc[0].get(date_col, "") or "").strip()
+        if d0 and (d0[0].isdigit() or "/" in d0[:5]):
+            return df
+    return pd.read_csv(csv_path, header=0, skiprows=range(1, max(1, sk)))
 
 
 def _normalize_eu_odds_text(s: str) -> str:
@@ -304,6 +522,30 @@ def _normalize_eu_odds_text(s: str) -> str:
         return m.group(0)
 
     return re.sub(r"(?<!\d)(\d+),(\d{2})\b", repl, s)
+
+
+def _parse_template_odds_float(raw: str | None) -> float | None:
+    """Parse odds for export: EU commas, thin/NBSP spaces; returns None if not a usable price."""
+    if raw is None:
+        return None
+    s = re.sub(
+        r"[\ufeff\u200b-\u200f]",
+        "",
+        str(raw)
+        .replace("\xa0", " ")
+        .replace("\u202f", " ")
+        .replace("\u2009", " "),
+    ).strip()
+    if not s or s.lower() == "nan" or s in ("-", "–", "−", "—"):
+        return None
+    t = _normalize_eu_odds_text(s)
+    try:
+        v = float(str(t).replace(",", "."))
+    except ValueError:
+        return None
+    if 1.0 <= v <= 1000.0:
+        return v
+    return None
 
 
 def _normalize_oddsportal_netloc(url: str) -> str:
@@ -327,6 +569,56 @@ def _normalize_oddsportal_netloc(url: str) -> str:
     except Exception:
         pass
     return url
+
+
+def normalize_match_url(url: str) -> str:
+    """Canonical match URL used for equality/deduping across host variants."""
+    if not (url or "").strip():
+        return ""
+    try:
+        p = urlparse(_normalize_oddsportal_netloc(url.strip()))
+        scheme = (p.scheme or "https").lower()
+        host = (p.netloc or "").lower()
+        if host in ("wv.oddsportal.com", "oddsportal.com", "m.oddsportal.com"):
+            host = "www.oddsportal.com"
+        path = re.sub(r"/{2,}", "/", p.path or "/")
+        if not path.endswith("/"):
+            path += "/"
+        return urlunparse((scheme, host, path, "", "", ""))
+    except Exception:
+        return url.strip()
+
+
+def _dedupe_league_results(rows: list[MatchData]) -> list[MatchData]:
+    """One row per normalized match URL, keeping the most complete row."""
+    best: dict[str, MatchData] = {}
+
+    def _score(md: MatchData) -> int:
+        fields = (
+            md.date,
+            md.home_team,
+            md.away_team,
+            md.full_time_home,
+            md.full_time_away,
+            md.half_time_home,
+            md.half_time_away,
+            md.half_time_total,
+            md.over_odds or "",
+            md.under_odds or "",
+            md.betfair_lay_over or "",
+            md.betfair_lay_under or "",
+        )
+        return sum(1 for x in fields if (x or "").strip())
+
+    for md in rows:
+        key = normalize_match_url(md.match_url) or (md.match_url or "").strip()
+        if not key:
+            continue
+        prev = best.get(key)
+        if prev is None or _score(md) >= _score(prev):
+            best[key] = md
+
+    return list(best.values())
 
 
 def _betting_exchanges_block_start(low_full: str) -> int:
@@ -806,6 +1098,16 @@ def _parse_score(score: str) -> tuple[str, str]:
     return "", ""
 
 
+def _normalize_results_row_ft_score(raw: str) -> str:
+    """Normalize a listed FT score token to 'h:a'."""
+    if not (raw or "").strip():
+        return ""
+    m = re.search(r"(?<!\d)(\d{1,2})\s*[-:]\s*(\d{1,2})(?!\d)", str(raw))
+    if not m:
+        return ""
+    return f"{m.group(1)}:{m.group(2)}"
+
+
 def _half_time_total_goals(ht_home: str, ht_away: str) -> str:
     """Sum of first-half goals for export column. Empty string if either side missing."""
     try:
@@ -970,6 +1272,39 @@ def teams_from_match_url(href: str) -> tuple[str, str]:
         return _split_legacy_combined_slug(team_slug)
     except Exception:
         return "?", "?"
+
+
+def merge_listing_and_api_home_away(
+    listing_home: str,
+    listing_away: str,
+    api_home: str | None,
+    api_away: str | None,
+    fix_home: str,
+    fix_away: str,
+) -> tuple[str, str]:
+    """Prefer listing order, but if listing and API are exact reverse of each other, trust API."""
+    lh = (listing_home or "").strip()
+    la = (listing_away or "").strip()
+    ah = (api_home or "").strip()
+    aa = (api_away or "").strip()
+    if (
+        lh
+        and la
+        and lh != "?"
+        and la != "?"
+        and ah
+        and aa
+        and lh.casefold() == aa.casefold()
+        and la.casefold() == ah.casefold()
+    ):
+        return ah, aa
+    if lh and la and lh != "?" and la != "?":
+        return lh, la
+    if ah and aa:
+        return ah, aa
+    if fix_home != "?" and fix_away != "?":
+        return fix_home, fix_away
+    return lh or ah or "", la or aa or ""
 
 
 def _looks_like_team_line(s: str) -> bool:
@@ -1324,10 +1659,12 @@ def parse_results_page_html(html: str, base_url: str, league_name: str) -> list[
                     line,
                 ):
                     date_val = line
-                elif re.match(r"^\(\d+[:\-]\d+\)", line):
-                    score_ht = line.strip("()").replace("-", ":")
-                elif re.match(r"^\d{1,2}[:\-]\d{1,2}$", line) and _is_likely_score(line):
-                    score_ft = line.replace("-", ":")
+                elif re.match(r"^\(\s*\d+\s*[:\-]\s*\d+\s*\)$", line):
+                    score_ht = _normalize_results_row_ft_score(line.strip("()"))
+                else:
+                    ft_norm = _normalize_results_row_ft_score(line)
+                    if ft_norm and _is_likely_score(ft_norm):
+                        score_ft = ft_norm
             if score_ft:
                 break
             parent = getattr(parent, "parent", None)
@@ -2810,7 +3147,7 @@ async def main(run_config: ScraperConfig | None = None, progress_cb=None):
 
                     if not oldest_first:
                         def _match_sort_key(m: dict) -> tuple:
-                            dt = _parse_match_datetime(m.get("date") or "")
+                            dt = _parse_match_datetime(m.get("date") or "", league_url)
                             r = dom_rank.get(m.get("match_url", ""), 10_000)
                             if dt is None:
                                 return (1, 0.0, r)
@@ -2820,7 +3157,8 @@ async def main(run_config: ScraperConfig | None = None, progress_cb=None):
                     else:
                         _sent = datetime(9999, 12, 31, 23, 59, 59)
                         matches.sort(
-                            key=lambda m: _parse_match_datetime(m.get("date") or "") or _sent,
+                            key=lambda m: _parse_match_datetime(m.get("date") or "", league_url)
+                            or _sent,
                         )
 
                     if not matches and page_num == 1 and empty_attempt == 0:
@@ -3039,10 +3377,11 @@ async def main(run_config: ScraperConfig | None = None, progress_cb=None):
                     # Fixture date: trust the results page section ("Today, 11 Apr") — match pages often show
                     # kick-off or other lines that disagree with the list.
                     if listing_date:
-                        date_val = normalize_match_date_field(listing_date)
+                        date_val = normalize_match_date_field(listing_date, league_url)
                     else:
                         date_val = normalize_match_date_field(
                             api_result.get("date") or m.get("date") or "",
+                            league_url,
                         )
 
                     ft_home, ft_away = _parse_score(score_ft)
@@ -3051,25 +3390,14 @@ async def main(run_config: ScraperConfig | None = None, progress_cb=None):
                     fix_home, fix_away = teams_from_match_url(mu_merge)
                     listing_home = (m.get("home_team") or "").strip()
                     listing_away = (m.get("away_team") or "").strip()
-                    listing_teams_ok = listing_home and listing_away and listing_home != "?" and listing_away != "?"
-                    if is_h2h and listing_teams_ok:
-                        home_team = listing_home or api_result.get("home_team") or (
-                            fix_home if fix_home != "?" else ""
-                        )
-                        away_team = listing_away or api_result.get("away_team") or (
-                            fix_away if fix_away != "?" else ""
-                        )
-                    else:
-                        home_team = (
-                            api_result.get("home_team")
-                            or m.get("home_team")
-                            or (fix_home if fix_home != "?" else "")
-                        )
-                        away_team = (
-                            api_result.get("away_team")
-                            or m.get("away_team")
-                            or (fix_away if fix_away != "?" else "")
-                        )
+                    home_team, away_team = merge_listing_and_api_home_away(
+                        listing_home,
+                        listing_away,
+                        api_result.get("home_team"),
+                        api_result.get("away_team"),
+                        fix_home,
+                        fix_away,
+                    )
 
                     new_row = MatchData(
                         date=date_val,
@@ -3128,6 +3456,7 @@ async def main(run_config: ScraperConfig | None = None, progress_cb=None):
                         _sort_results_for_export(league_results, oldest_first=oldest_first)
                         try:
                             _write_matches_template_csv(out_dir / f"{slug}.csv", league_results)
+                            _write_matches_template_xlsx(out_dir / f"{slug}.xlsx", league_results)
                         except PermissionError:
                             pass
                     time.sleep(config.DELAY_BETWEEN_REQUESTS)

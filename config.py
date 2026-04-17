@@ -37,6 +37,12 @@ TARGET_MATCHES_PER_SEASON = None
 
 # Output - one CSV per league/season in output_dir
 OUTPUT_DIR = "output"
+# Excel: first row of match data (1-based). Rows 1–(MATCH_DATA_START_ROW - 1) are header / summary (see template).
+MATCH_DATA_START_ROW = 10
+# If OUTPUT_DIR / EXCEL_TEMPLATE_FILE exists, .xlsx exports copy that workbook (rows 1–4 unchanged) and fill from MATCH_DATA_START_ROW.
+EXCEL_TEMPLATE_FILE = "Template_Frame.xlsx"
+# Optional: absolute path to the template .xlsx (overrides repo templates/ and OUTPUT_DIR when non-empty).
+EXCEL_TEMPLATE_ABSOLUTE = ""
 
 # Save screenshot of each match page (date, odds visible) for later OCR/manual use
 # Disable for full-season runs to speed up (380 screenshots = ~15+ min extra)
