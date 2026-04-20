@@ -1582,7 +1582,11 @@ def _normalize_href_for_match(href: str) -> str:
 
 
 def _find_section_date_before_anchor_soup(soup, anchor) -> str:
-    """Last section header ('Today, 11 Apr', 'Yesterday, 10 Apr') before this link in **document order**.
+    """Last section header before this link in **document order** (grey bars).
+
+    OddsPortal uses either a relative bar (``Yesterday, 19 Apr``) or a plain calendar bar
+    (``18 Apr 2026``). Without the latter, matches under the plain bar still carried the previous
+    relative bar's date.
 
     OddsPortal puts the bar outside the row; sibling-walking misses it. Tree order matches the page.
     Match by **href**, not ``el is anchor`` — BeautifulSoup can break object identity across traversals.
@@ -1590,6 +1594,7 @@ def _find_section_date_before_anchor_soup(soup, anchor) -> str:
     header_re = re.compile(
         r"(?i)^(Today|Yesterday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\s*,\s*\d{1,2}\s+[A-Za-z]{3}\s*$"
     )
+    plain_bar_re = re.compile(r"^\d{1,2}\s+[A-Za-z]{3}\s+20\d{2}\s*$")
     want = _normalize_href_for_match(anchor.get("href", ""))
     if not want:
         return ""
@@ -1605,7 +1610,7 @@ def _find_section_date_before_anchor_soup(soup, anchor) -> str:
             continue
         for line in text.split("\n"):
             ln = line.strip()
-            if 10 <= len(ln) < 50 and header_re.match(ln):
+            if 8 <= len(ln) < 50 and (header_re.match(ln) or plain_bar_re.match(ln)):
                 current = ln
     return current
 
@@ -1756,7 +1761,8 @@ async def enrich_match_teams_from_results_layout(page, matches: list[dict]) -> N
                 return null;
             };
             const sectionDateBeforeAnchor = (anchor) => {
-                const re = /^(Today|Yesterday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\\s*,\\s*\\d{1,2}\\s+[A-Za-z]{3}/i;
+                const reBar = /^(Today|Yesterday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\\s*,\\s*\\d{1,2}\\s+[A-Za-z]{3}/i;
+                const rePlain = /^\\d{1,2}\\s+[A-Za-z]{3}\\s+20\\d{2}$/;
                 let current = null;
                 const it = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT, null);
                 let node;
@@ -1766,7 +1772,7 @@ async def enrich_match_teams_from_results_layout(page, matches: list[dict]) -> N
                     if (t.length > 100) continue;
                     for (const line of t.split('\\n')) {
                         const ln = line.trim();
-                        if (ln.length >= 10 && ln.length < 48 && re.test(ln)) current = ln;
+                        if (ln.length >= 8 && ln.length < 48 && (reBar.test(ln) || rePlain.test(ln))) current = ln;
                     }
                 }
                 return current;

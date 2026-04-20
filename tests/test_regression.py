@@ -132,6 +132,32 @@ def test_parse_results_html_spaced_score():
     assert r0.get("score_ft") == "2:1"
 
 
+def test_parse_results_plain_date_bar_after_yesterday_bar():
+    """OddsPortal often uses 'Yesterday, 19 Apr' then a plain '18 Apr 2026' bar; later rows must not keep yesterday's date."""
+    html = """
+<html><body>
+<div>Yesterday, 19 Apr</div>
+<div>
+  <a href="/football/england/league-one-2025-2026/port-vale-wigan-AbCdEfGh/">x</a>
+  <div>0 - 0</div>
+</div>
+<div>18 Apr 2026</div>
+<div>
+  <a href="/football/england/league-one-2025-2026/afc-wimbledon-plymouth-XyZaBcDe/">x</a>
+  <div>1 - 3</div>
+</div>
+</body></html>
+"""
+    rows = parse_results_page_html(html, "", "League One")
+    by_url = {r["match_url"]: r for r in rows}
+    u1 = next(k for k in by_url if "port-vale" in k)
+    u2 = next(k for k in by_url if "wimbledon" in k)
+    assert "Yesterday" in (by_url[u1].get("date") or "") or "19" in (by_url[u1].get("date") or "")
+    d2 = (by_url[u2].get("date") or "").strip()
+    assert "18" in d2 and "Apr" in d2
+    assert "Yesterday" not in d2
+
+
 def test_template_csv_partial_row_resume():
     tmp = Path(tempfile.mkdtemp())
     slug = "t-league"
