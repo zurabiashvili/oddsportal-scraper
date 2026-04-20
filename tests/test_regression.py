@@ -252,7 +252,7 @@ def test_template_csv_average_betfair_lay_under_summary():
         ),
     ]
     _write_matches_template_csv(out_csv, rows)
-    with open(out_csv, newline="", encoding="utf-8") as f:
+    with open(out_csv, newline="", encoding="utf-8-sig") as f:
         data = list(csv.reader(f))
     assert data[1][13] == "AVERAGE ODDS"
     assert data[2][13] == _template_n_avg_odds_formula()

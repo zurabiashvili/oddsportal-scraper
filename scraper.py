@@ -393,8 +393,9 @@ def _write_matches_template_csv(path: Path, league_results: list[MatchData]) -> 
     row4 = empty.copy()
     row4[13] = EXPORT_TEMPLATE_N_IMPLIED_PCT_FORMULA
     row4[16] = EXPORT_TEMPLATE_Q_EV_FORMULA
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
+    # utf-8-sig + quote all fields: Excel often miscounts columns when commas appear in URLs unless fields are quoted.
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f, quoting=csv.QUOTE_ALL, lineterminator="\n")
         w.writerow(headers)
         w.writerow(row2)
         w.writerow(row3)
@@ -484,10 +485,10 @@ def _read_results_dataframe(csv_path: Path):
     """Load dataframe from template CSV (summary rows, then data from MATCH_DATA_START_ROW; legacy row 11 supported)."""
     import pandas as pd
 
-    with open(csv_path, encoding="utf-8") as f:
+    with open(csv_path, encoding="utf-8-sig") as f:
         line1 = f.readline()
     if "Home Team" not in line1 or "Away Team" not in line1:
-        return pd.read_csv(csv_path, header=0)
+        return pd.read_csv(csv_path, header=0, encoding="utf-8-sig")
     start = _template_match_data_start_row()
     candidates: list[int] = []
     sk = start - 1
@@ -496,14 +497,14 @@ def _read_results_dataframe(csv_path: Path):
     if 10 >= 1 and 10 not in candidates:
         candidates.append(10)
     for skip_end in candidates:
-        df = pd.read_csv(csv_path, header=0, skiprows=range(1, skip_end))
+        df = pd.read_csv(csv_path, header=0, skiprows=range(1, skip_end), encoding="utf-8-sig")
         if len(df) == 0:
             continue
         date_col = "Date" if "Date" in df.columns else df.columns[0]
         d0 = str(df.iloc[0].get(date_col, "") or "").strip()
         if d0 and (d0[0].isdigit() or "/" in d0[:5]):
             return df
-    return pd.read_csv(csv_path, header=0, skiprows=range(1, max(1, sk)))
+    return pd.read_csv(csv_path, header=0, skiprows=range(1, max(1, sk)), encoding="utf-8-sig")
 
 
 def _normalize_eu_odds_text(s: str) -> str:
