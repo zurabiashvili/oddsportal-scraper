@@ -179,7 +179,7 @@ EXPORT_TEMPLATE_G_HEADER = "AVG % of matches with at least one goal"
 EXPORT_TEMPLATE_N_AVG_BETFAIR_LAY_ODDS_LABEL = "AVERAGE ODDS"
 # N4: implied % from average lay odds (lay break-even framing): 100-(100/N3). Example: N3=3.346 → ~70.11%.
 EXPORT_TEMPLATE_N_IMPLIED_PCT_FORMULA = '=IFERROR(100-(100/N3),"")'
-# P2: EDGE vs average odds; G2 must be a fraction (0.6 = 60%) so 100% is the number 1 in Excel.
+# P2: EDGE = observed HT goal rate (G2) minus lay break-even (1-1/N3); G2 fraction (0.6=60%); average lay in N3 (e.g. N3=3.63 → ≈-12.45%).
 EXPORT_TEMPLATE_P_EDGE_FORMULA = "=G2-(100%-(1/N3))"
 # Q4: EV (percentage points) = real% minus N4; G2 is fraction so use G2*100.
 EXPORT_TEMPLATE_Q_EV_FORMULA = '=IFERROR(G2*100-N4,"")'
